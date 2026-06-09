@@ -9,7 +9,12 @@ const app = express();
 
 // ✅ FIX 2: Single clean CORS config — allows Vercel + local dev
 app.use(cors({
-  origin: ['https://car-shop-system.vercel.app', 'http://localhost:3000', 'http://localhost:5173'],
+  origin: [
+    'https://car-shop-system-zho8.vercel.app', // Your exact live link
+    'https://car-shop-system.vercel.app', 
+    'http://localhost:3000', 
+    'http://localhost:5173'
+  ],
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   credentials: true
 }));
@@ -19,7 +24,12 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['https://car-shop-system.vercel.app', 'http://localhost:3000', 'http://localhost:5173'],
+    origin: [
+      'https://car-shop-system-zho8.vercel.app', // Added here for live updates too
+      'https://car-shop-system.vercel.app', 
+      'http://localhost:3000', 
+      'http://localhost:5173'
+    ],
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
   }
 });
