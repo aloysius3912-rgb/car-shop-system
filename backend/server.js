@@ -114,3 +114,15 @@ server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`🗄️  Database: ${process.env.DATABASE_URL ? 'Render PostgreSQL' : 'Local Docker'}`);
 });
+
+// ── Debug: check database columns
+app.get('/api/debug', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT column_name FROM information_schema.columns WHERE table_name='members'"
+    );
+    res.json({ columns: result.rows, db: process.env.DATABASE_URL ? 'Neon' : 'Local' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
