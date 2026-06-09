@@ -7,10 +7,11 @@ const cors = require('cors');
 // ✅ FIX 1: app must be created BEFORE you can use app.use()
 const app = express();
 
-// ✅ FIX 2: Single clean CORS config — allows Vercel + local dev
+// ✅ FIX 2: Single clean CORS config — allows Vercel preview, production + local dev
 app.use(cors({
   origin: [
-    'https://car-shop-system-zho8.vercel.app', // Your exact live link
+    'https://car-shop-system-zho8-git-main-aloysius3912-rgbs-projects.vercel.app', // Your exact live Safari preview link
+    'https://car-shop-system-zho8.vercel.app', 
     'https://car-shop-system.vercel.app', 
     'http://localhost:3000', 
     'http://localhost:5173'
@@ -25,7 +26,8 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: [
-      'https://car-shop-system-zho8.vercel.app', // Added here for live updates too
+      'https://car-shop-system-zho8-git-main-aloysius3912-rgbs-projects.vercel.app', // Added here for real-time Socket updates too
+      'https://car-shop-system-zho8.vercel.app', 
       'https://car-shop-system.vercel.app', 
       'http://localhost:3000', 
       'http://localhost:5173'
@@ -82,8 +84,8 @@ app.post('/api/add-points', async (req, res) => {
       [memberId, numericPoints, description]
     );
 
-    // ✅ FIX 4: result.rows is an array — need [0] to get the first row
-    const newTotal = result.rows[0].total_points;
+    // ✅ FIX 4: result.rows is an array — need to get the first row
+    const newTotal = result.rows.total_points;
     io.emit('pointsUpdated', { memberId, newTotal });
     res.json({ success: true, newTotal });
   } catch (err) {
@@ -104,8 +106,8 @@ app.post('/api/new-member', async (req, res) => {
       [fullName.trim(), carPlate ? carPlate.trim().toUpperCase() : null]
     );
 
-    // ✅ FIX 5: result.rows is an array — need [0] to get the inserted member
-    const newMember = result.rows[0];
+    // ✅ FIX 5: result.rows is an array — need to get the inserted member
+    const newMember = result.rows;
     io.emit('memberAdded', newMember);
     res.json({ success: true, member: newMember });
   } catch (err) {
