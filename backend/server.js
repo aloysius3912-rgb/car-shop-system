@@ -6,7 +6,6 @@ const cors = require('cors');
 
 const app = express();
 
-// ✅ Allow ALL origins (fixes Vercel URL mismatch)
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
@@ -15,7 +14,6 @@ const io = new Server(server, {
   cors: { origin: '*' }
 });
 
-// ✅ Use Render's DATABASE_URL in production, local Docker for development
 const pool = new Pool(
   process.env.DATABASE_URL
     ? {
@@ -72,16 +70,20 @@ app.post('/api/add-points', async (req, res) => {
   }
 });
 
-// ── Register a new member
+// ── Register a new member (now includes car_model and date_joined)
 app.post('/api/new-member', async (req, res) => {
-  const { fullName, carPlate } = req.body;
+  const { fullName, carPlate, carModel } = req.body;
   if (!fullName || !fullName.trim()) {
     return res.status(400).json({ error: 'Full name is required' });
   }
   try {
     const result = await pool.query(
-      'INSERT INTO members (full_name, car_plate, total_points) VALUES ($1, $2, 0) RETURNING *',
-      [fullName.trim(), carPlate ? carPlate.trim().toUpperCase() : null]
+      'INSERT INTO members (full_name, car_plate, car_model, total_points, date_joined) VALUES ($1, $2, $3, 0, NOW()) RETURNING *',
+      [
+        fullName.trim(),
+        carPlate ? carPlate.trim().toUpperCase() : null,
+        carModel ? carModel.trim() : null,
+      ]
     );
 
     const newMember = result.rows[0];
