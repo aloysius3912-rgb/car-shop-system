@@ -105,11 +105,25 @@ app.post('/api/new-member', async (req, res) => {
     return res.status(400).json({ error: 'Full name is required' });
   }
   try {
+    // ── Check for duplicate car plate (case-insensitive)
+    const normalizedPlate = carPlate ? carPlate.trim().toUpperCase() : null;
+    if (normalizedPlate) {
+      const existing = await pool.query(
+        'SELECT member_id, full_name FROM members WHERE UPPER(car_plate) = $1',
+        [normalizedPlate]
+      );
+      if (existing.rows.length > 0) {
+        return res.status(409).json({
+          error: `Plate ${normalizedPlate} is already registered to ${existing.rows[0].full_name}`,
+        });
+      }
+    }
+
     const result = await pool.query(
       'INSERT INTO members (full_name, car_plate, car_model, total_points, date_joined) VALUES ($1, $2, $3, 0, NOW()) RETURNING *',
       [
         fullName.trim(),
-        carPlate ? carPlate.trim().toUpperCase() : null,
+        normalizedPlate,
         carModel ? carModel.trim() : null,
       ]
     );
