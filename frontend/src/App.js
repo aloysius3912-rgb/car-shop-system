@@ -97,11 +97,67 @@ function inputStyle(extra = {}) {
   };
 }
 
-// Format date nicely e.g. "9 Jun 2026"
 function formatDate(dateStr) {
   if (!dateStr) return 'Unknown';
   const d = new Date(dateStr);
   return d.toLocaleDateString('en-SG', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function formatDateTime(dateStr) {
+  if (!dateStr) return '';
+  const d = new Date(dateStr);
+  return d.toLocaleDateString('en-SG', { day: 'numeric', month: 'short' }) + ', ' +
+    d.toLocaleTimeString('en-SG', { hour: '2-digit', minute: '2-digit' });
+}
+
+// ── Transaction History Drawer ──
+function HistoryDrawer({ memberId, isOpen, transactions, loading }) {
+  if (!isOpen) return null;
+
+  return (
+    <div style={{
+      width: '100%', marginTop: 14, paddingTop: 14,
+      borderTop: '1px solid #1e1e3f',
+      animation: 'fadeIn 0.2s ease both',
+    }}>
+      <div style={{ fontSize: 11, color: '#10b981', letterSpacing: 2, marginBottom: 10, textTransform: 'uppercase' }}>
+        Transaction History
+      </div>
+
+      {loading ? (
+        <div style={{ color: '#555', fontSize: 13, padding: '8px 0' }}>Loading history…</div>
+      ) : transactions.length === 0 ? (
+        <div style={{ color: '#555', fontSize: 13, padding: '8px 0' }}>No transactions yet.</div>
+      ) : (
+        <div style={{
+          display: 'flex', flexDirection: 'column', gap: 8,
+          maxHeight: 220, overflowY: 'auto', paddingRight: 6,
+        }}>
+          {transactions.map(tx => {
+            const positive = tx.points_added >= 0;
+            return (
+              <div key={tx.transaction_id} style={{
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                background: '#0d0d1a', border: '1px solid #1e1e3f',
+                borderRadius: 8, padding: '10px 14px', fontSize: 13,
+              }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span style={{ color: '#ddd' }}>{tx.description || 'No description'}</span>
+                  <span style={{ color: '#555', fontSize: 11 }}>{formatDateTime(tx.transaction_date)}</span>
+                </div>
+                <span style={{
+                  color: positive ? '#10b981' : '#ef4444',
+                  fontWeight: 700, fontSize: 14, whiteSpace: 'nowrap', marginLeft: 12,
+                }}>
+                  {positive ? '+' : ''}{tx.points_added} pts
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function App() {
@@ -116,6 +172,11 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [serverWaking, setServerWaking] = useState(false);
+
+  // History drawer state
+  const [openHistory, setOpenHistory] = useState({});       // { [memberId]: true/false }
+  const [historyData, setHistoryData] = useState({});       // { [memberId]: [...] }
+  const [historyLoading, setHistoryLoading] = useState({});  // { [memberId]: true/false }
 
   const fetchMembers = useCallback(() => {
     setLoading(true);
@@ -142,9 +203,17 @@ export default function App() {
     socket.on('memberDeleted', ({ memberId }) => {
       setMembers(prev => prev.filter(raw => norm(raw).member_id != memberId));
     });
+    // Live-update history drawer if open for that member
+    socket.on('transactionAdded', ({ memberId, transaction }) => {
+      setHistoryData(prev => {
+        if (!prev[memberId]) return prev;
+        return { ...prev, [memberId]: [transaction, ...prev[memberId]] };
+      });
+    });
     return () => {
       socket.off('connect'); socket.off('disconnect');
       socket.off('pointsUpdated'); socket.off('memberAdded'); socket.off('memberDeleted');
+      socket.off('transactionAdded');
     };
   }, [fetchMembers]);
 
@@ -197,6 +266,25 @@ export default function App() {
     }
   };
 
+  // ── Toggle history drawer, fetch on first open ──
+  const toggleHistory = async (memberId) => {
+    const isOpen = openHistory[memberId];
+    setOpenHistory(prev => ({ ...prev, [memberId]: !isOpen }));
+
+    if (!isOpen && !historyData[memberId]) {
+      setHistoryLoading(prev => ({ ...prev, [memberId]: true }));
+      try {
+        const data = await apiFetch(`/api/transactions/${memberId}`);
+        setHistoryData(prev => ({ ...prev, [memberId]: Array.isArray(data) ? data : [] }));
+      } catch (err) {
+        toast(`Could not load history: ${err.message}`, 'error');
+        setHistoryData(prev => ({ ...prev, [memberId]: [] }));
+      } finally {
+        setHistoryLoading(prev => ({ ...prev, [memberId]: false }));
+      }
+    }
+  };
+
   const filteredMembers = members
     .filter(raw => {
       const m = norm(raw);
@@ -219,6 +307,8 @@ export default function App() {
         @keyframes slideUp { from { transform: translateY(16px); opacity:0; } to { transform: translateY(0); opacity:1; } }
         @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
         @keyframes spin { to { transform: rotate(360deg); } }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: #1e1e3f; border-radius: 3px; }
       `}</style>
 
       <Toast />
@@ -299,58 +389,85 @@ export default function App() {
               const tier = pts >= 1000 ? { label: 'GOLD', color: '#f59e0b' }
                 : pts >= 500 ? { label: 'SILVER', color: '#94a3b8' }
                 : { label: 'BRONZE', color: '#cd7c3a' };
+              const isHistoryOpen = !!openHistory[member.member_id];
 
               return (
                 <div key={member.member_id || index} style={{
                   background: '#13132a', border: '1px solid #1e1e3f', borderRadius: 12,
-                  padding: '18px 20px', display: 'flex', justifyContent: 'space-between',
-                  alignItems: 'center', gap: 16, flexWrap: 'wrap',
+                  padding: '18px 20px',
                   animation: 'fadeIn 0.25s ease both', animationDelay: `${index * 0.04}s`,
                 }}>
-                  {/* INFO */}
-                  <div style={{ flex: '1 1 200px', minWidth: 0 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>
-                      <span style={{ fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 18, color: '#fff' }}>{member.full_name}</span>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+                    {/* INFO */}
+                    <div style={{ flex: '1 1 200px', minWidth: 0 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>
+                        <span style={{ fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 18, color: '#fff' }}>{member.full_name}</span>
 
-                      {member.car_plate && (
-                        <span style={{ background: '#f59e0b22', color: '#f59e0b', border: '1px solid #f59e0b55', padding: '2px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600, letterSpacing: 2 }}>
-                          {member.car_plate.toUpperCase()}
+                        {member.car_plate && (
+                          <span style={{ background: '#f59e0b22', color: '#f59e0b', border: '1px solid #f59e0b55', padding: '2px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600, letterSpacing: 2 }}>
+                            {member.car_plate.toUpperCase()}
+                          </span>
+                        )}
+
+                        <span style={{ background: `${tier.color}18`, color: tier.color, border: `1px solid ${tier.color}44`, padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700, letterSpacing: 1.5 }}>
+                          {tier.label}
                         </span>
-                      )}
+                      </div>
 
-                      <span style={{ background: `${tier.color}18`, color: tier.color, border: `1px solid ${tier.color}44`, padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700, letterSpacing: 1.5 }}>
-                        {tier.label}
-                      </span>
+                      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 8 }}>
+                        {member.car_model && (
+                          <span style={{ fontSize: 12, color: '#888' }}>🚗 {member.car_model}</span>
+                        )}
+                        <span style={{ fontSize: 12, color: '#555' }}>
+                          📅 Joined {formatDate(member.date_joined)}
+                        </span>
+                      </div>
+
+                      <div style={{ display: 'flex', alignItems: 'baseline', gap: 5 }}>
+                        <span style={{ fontSize: 28, fontWeight: 700, color: '#10b981' }}>{pts.toLocaleString()}</span>
+                        <span style={{ fontSize: 12, color: '#555' }}>pts</span>
+                      </div>
                     </div>
 
-                    {/* Car model + date joined */}
-                    <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 8 }}>
-                      {member.car_model && (
-                        <span style={{ fontSize: 12, color: '#888' }}>🚗 {member.car_model}</span>
-                      )}
-                      <span style={{ fontSize: 12, color: '#555' }}>
-                        📅 Joined {formatDate(member.date_joined)}
-                      </span>
-                    </div>
-
-                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 5 }}>
-                      <span style={{ fontSize: 28, fontWeight: 700, color: '#10b981' }}>{pts.toLocaleString()}</span>
-                      <span style={{ fontSize: 12, color: '#555' }}>pts</span>
+                    {/* CONTROLS */}
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <input
+                        type="number" placeholder="+/-"
+                        value={adjustments[member.member_id] || ''}
+                        onChange={e => setAdjustments(prev => ({ ...prev, [member.member_id]: e.target.value }))}
+                        onKeyDown={e => e.key === 'Enter' && handleUpdatePoints(member.member_id)}
+                        style={inputStyle({ width: 80, textAlign: 'center', padding: '9px 8px' })}
+                      />
+                      <button onClick={() => handleUpdatePoints(member.member_id)} style={btnStyle('#3b82f6', '#fff')}>Apply</button>
+                      <button onClick={() => handleDeleteMember(member.member_id, member.full_name)} style={btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455' })}>Delete</button>
                     </div>
                   </div>
 
-                  {/* CONTROLS */}
-                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                    <input
-                      type="number" placeholder="+/-"
-                      value={adjustments[member.member_id] || ''}
-                      onChange={e => setAdjustments(prev => ({ ...prev, [member.member_id]: e.target.value }))}
-                      onKeyDown={e => e.key === 'Enter' && handleUpdatePoints(member.member_id)}
-                      style={inputStyle({ width: 80, textAlign: 'center', padding: '9px 8px' })}
-                    />
-                    <button onClick={() => handleUpdatePoints(member.member_id)} style={btnStyle('#3b82f6', '#fff')}>Apply</button>
-                    <button onClick={() => handleDeleteMember(member.member_id, member.full_name)} style={btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455' })}>Delete</button>
+                  {/* HISTORY TOGGLE */}
+                  <div style={{ marginTop: 12 }}>
+                    <button
+                      onClick={() => toggleHistory(member.member_id)}
+                      style={{
+                        background: 'none', border: 'none', color: '#10b981',
+                        fontFamily: "'DM Mono', monospace", fontSize: 12,
+                        cursor: 'pointer', padding: 0, display: 'flex',
+                        alignItems: 'center', gap: 6, letterSpacing: 1,
+                      }}
+                    >
+                      <span style={{
+                        display: 'inline-block', transition: 'transform 0.2s',
+                        transform: isHistoryOpen ? 'rotate(90deg)' : 'rotate(0deg)',
+                      }}>▶</span>
+                      {isHistoryOpen ? 'Hide History' : 'View History'}
+                    </button>
                   </div>
+
+                  <HistoryDrawer
+                    memberId={member.member_id}
+                    isOpen={isHistoryOpen}
+                    transactions={historyData[member.member_id] || []}
+                    loading={!!historyLoading[member.member_id]}
+                  />
                 </div>
               );
             })}

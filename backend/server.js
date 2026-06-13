@@ -35,6 +35,18 @@ app.get('/', (req, res) => {
   res.json({ status: 'Car Shop backend is running ✅' });
 });
 
+// ── Debug: check database columns
+app.get('/api/debug', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT column_name FROM information_schema.columns WHERE table_name='members'"
+    );
+    res.json({ columns: result.rows, db: process.env.DATABASE_URL ? 'Neon' : 'Local' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Fetch ALL members
 app.get('/api/members', async (req, res) => {
   try {
@@ -42,6 +54,21 @@ app.get('/api/members', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error('GET /api/members error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── NEW: Fetch transaction history for a specific member
+app.get('/api/transactions/:memberId', async (req, res) => {
+  const { memberId } = req.params;
+  try {
+    const result = await pool.query(
+      'SELECT transaction_id, points_added, description, transaction_date FROM point_transactions WHERE member_id = $1 ORDER BY transaction_date DESC LIMIT 50',
+      [memberId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('GET /api/transactions error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -56,13 +83,14 @@ app.post('/api/add-points', async (req, res) => {
       [numericPoints, memberId]
     );
 
-    await pool.query(
-      'INSERT INTO point_transactions (member_id, points_added, description) VALUES ($1, $2, $3)',
+    const txResult = await pool.query(
+      'INSERT INTO point_transactions (member_id, points_added, description) VALUES ($1, $2, $3) RETURNING transaction_id, points_added, description, transaction_date',
       [memberId, numericPoints, description]
     );
 
     const newTotal = result.rows[0].total_points;
     io.emit('pointsUpdated', { memberId, newTotal });
+    io.emit('transactionAdded', { memberId, transaction: txResult.rows[0] });
     res.json({ success: true, newTotal });
   } catch (err) {
     console.error('POST /api/add-points error:', err.message);
@@ -70,7 +98,7 @@ app.post('/api/add-points', async (req, res) => {
   }
 });
 
-// ── Register a new member (now includes car_model and date_joined)
+// ── Register a new member
 app.post('/api/new-member', async (req, res) => {
   const { fullName, carPlate, carModel } = req.body;
   if (!fullName || !fullName.trim()) {
@@ -113,16 +141,4 @@ const PORT = process.env.PORT || 5001;
 server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`🗄️  Database: ${process.env.DATABASE_URL ? 'Render PostgreSQL' : 'Local Docker'}`);
-});
-
-// ── Debug: check database columns
-app.get('/api/debug', async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT column_name FROM information_schema.columns WHERE table_name='members'"
-    );
-    res.json({ columns: result.rows, db: process.env.DATABASE_URL ? 'Neon' : 'Local' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
 });
