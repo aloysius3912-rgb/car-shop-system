@@ -6,7 +6,13 @@ const cors = require('cors');
 
 const app = express();
 
-app.use(cors({ origin: '*' }));
+// ── Allowed frontend origins ──
+const ALLOWED_ORIGINS = [
+  'https://car-shop-system-zho8.vercel.app',
+  'http://localhost:3000', // local development
+];
+
+app.use(cors({ origin: ALLOWED_ORIGINS }));
 app.use(express.json());
 
 // ── Simple password gate ──
@@ -15,7 +21,33 @@ app.use(express.json());
 // 'x-admin-token' header to match ADMIN_PASSWORD.
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
 
-app.post('/api/login', (req, res) => {
+// ── Simple rate limiter for /api/login (5 attempts per 15 min per IP) ──
+const loginAttempts = new Map(); // ip -> { count, resetAt }
+const LOGIN_LIMIT = 5;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+
+function loginRateLimiter(req, res, next) {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.ip;
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+
+  if (!entry || now > entry.resetAt) {
+    loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+    return next();
+  }
+
+  if (entry.count >= LOGIN_LIMIT) {
+    const minutesLeft = Math.ceil((entry.resetAt - now) / 60000);
+    return res.status(429).json({
+      error: `Too many attempts. Try again in ${minutesLeft} minute(s).`,
+    });
+  }
+
+  entry.count += 1;
+  next();
+}
+
+app.post('/api/login', loginRateLimiter, (req, res) => {
   const { password } = req.body;
   if (password === ADMIN_PASSWORD) {
     // Token is just the password itself for simplicity — kept secret via HTTPS
@@ -26,7 +58,7 @@ app.post('/api/login', (req, res) => {
 });
 
 app.use('/api', (req, res, next) => {
-  if (req.path === '/login' || req.path === '/debug') return next();
+  if (req.path === '/login') return next();
   const token = req.headers['x-admin-token'];
   if (token !== ADMIN_PASSWORD) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -36,7 +68,7 @@ app.use('/api', (req, res, next) => {
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: '*' }
+  cors: { origin: ALLOWED_ORIGINS }
 });
 
 const pool = new Pool(
@@ -58,18 +90,6 @@ const pool = new Pool(
 // ── Health check
 app.get('/', (req, res) => {
   res.json({ status: 'Car Shop backend is running ✅' });
-});
-
-// ── Debug: check database columns
-app.get('/api/debug', async (req, res) => {
-  try {
-    const result = await pool.query(
-      "SELECT column_name FROM information_schema.columns WHERE table_name='members'"
-    );
-    res.json({ columns: result.rows, db: process.env.DATABASE_URL ? 'Neon' : 'Local' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // ── Fetch ALL members
