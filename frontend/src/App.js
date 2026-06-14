@@ -30,6 +30,8 @@ function Toast() {
 
 const norm = (raw) => raw?.['0'] || raw;
 
+let _onUnauthorized = () => {};
+
 const apiFetch = (path, opts = {}) =>
   fetch(`${API_BASE}${path}`, {
     headers: {
@@ -40,7 +42,7 @@ const apiFetch = (path, opts = {}) =>
   }).then(async (res) => {
     if (res.status === 401) {
       localStorage.removeItem('carshop_token');
-      window.location.reload();
+      _onUnauthorized();
       throw new Error('Session expired. Please log in again.');
     }
     if (!res.ok) {
@@ -277,6 +279,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    _onUnauthorized = () => setAuthed(false);
+    if (!authed) {
+      setLoading(false);
+      return;
+    }
+
     fetchMembers();
     socket.on('connect', () => setConnected(true));
     socket.on('disconnect', () => setConnected(false));
@@ -302,7 +310,7 @@ export default function App() {
       socket.off('pointsUpdated'); socket.off('memberAdded'); socket.off('memberDeleted');
       socket.off('transactionAdded');
     };
-  }, [fetchMembers]);
+  }, [fetchMembers, authed]);
 
   const handleAddMember = async (e) => {
     e.preventDefault();
