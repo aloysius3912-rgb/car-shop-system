@@ -32,9 +32,17 @@ const norm = (raw) => raw?.['0'] || raw;
 
 const apiFetch = (path, opts = {}) =>
   fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-admin-token': localStorage.getItem('carshop_token') || '',
+    },
     ...opts,
   }).then(async (res) => {
+    if (res.status === 401) {
+      localStorage.removeItem('carshop_token');
+      window.location.reload();
+      throw new Error('Session expired. Please log in again.');
+    }
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || `HTTP ${res.status}`);
@@ -160,7 +168,86 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading }) {
   );
 }
 
+// ── Login Screen ──
+function LoginScreen({ onSuccess }) {
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        localStorage.setItem('carshop_token', data.token);
+        onSuccess();
+      } else {
+        setError(data.error || 'Incorrect password');
+      }
+    } catch (err) {
+      setError('Could not reach server. Try again in a moment.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{
+      minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontFamily: "'DM Mono', monospace", background: '#0d0d1a', padding: 20,
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap');
+        @keyframes spin { to { transform: rotate(360deg); } }
+      `}</style>
+      <form onSubmit={handleSubmit} style={{
+        background: '#13132a', border: '1px solid #1e1e3f', borderRadius: 14,
+        padding: '40px 36px', maxWidth: 360, width: '100%', textAlign: 'center',
+      }}>
+        <div style={{ fontSize: 11, letterSpacing: 4, color: '#10b981', marginBottom: 6, textTransform: 'uppercase' }}>
+          Membership System
+        </div>
+        <h1 style={{ fontFamily: "'Syne', sans-serif", fontSize: 28, color: '#fff', fontWeight: 800, marginBottom: 24 }}>
+          Car Shop<br /><span style={{ color: '#10b981' }}>Dashboard</span>
+        </h1>
+        <input
+          type="password"
+          placeholder="Enter password…"
+          value={password}
+          onChange={e => setPassword(e.target.value)}
+          autoFocus
+          style={inputStyle({ width: '100%', textAlign: 'center', fontSize: 16, marginBottom: 14 })}
+        />
+        {error && (
+          <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>
+        )}
+        <button type="submit" disabled={loading} style={{
+          ...btnStyle('#10b981', '#0d0d1a'), width: '100%', opacity: loading ? 0.6 : 1,
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+        }}>
+          {loading && (
+            <span style={{
+              width: 14, height: 14, border: '2px solid #0d0d1a',
+              borderTopColor: 'transparent', borderRadius: '50%',
+              display: 'inline-block', animation: 'spin 0.7s linear infinite',
+            }} />
+          )}
+          {loading ? 'Checking…' : 'Unlock'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
 export default function App() {
+  const [authed, setAuthed] = useState(!!localStorage.getItem('carshop_token'));
   const [members, setMembers] = useState([]);
   const [newName, setNewName] = useState('');
   const [newPlate, setNewPlate] = useState('');
@@ -298,6 +385,10 @@ export default function App() {
     })
     .sort((a, b) => norm(a).full_name.localeCompare(norm(b).full_name));
 
+  if (!authed) {
+    return <LoginScreen onSuccess={() => setAuthed(true)} />;
+  }
+
   return (
     <>
       <style>{`
@@ -327,6 +418,14 @@ export default function App() {
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
             <StatusBadge connected={connected} />
             <span style={{ fontSize: 11, color: '#555' }}>{filteredMembers.length} member{filteredMembers.length !== 1 ? 's' : ''}</span>
+            <button
+              onClick={() => { localStorage.removeItem('carshop_token'); setAuthed(false); }}
+              style={{
+                background: 'none', border: '1px solid #1e1e3f', color: '#555',
+                fontFamily: "'DM Mono', monospace", fontSize: 11, letterSpacing: 1,
+                padding: '4px 10px', borderRadius: 6, cursor: 'pointer', marginTop: 4,
+              }}
+            >Lock</button>
           </div>
         </div>
 

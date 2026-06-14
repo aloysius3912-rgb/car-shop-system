@@ -9,6 +9,31 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
+// ── Simple password gate ──
+// Set ADMIN_PASSWORD in Render's Environment tab.
+// All /api routes (except /api/login and health check) require the
+// 'x-admin-token' header to match ADMIN_PASSWORD.
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
+
+app.post('/api/login', (req, res) => {
+  const { password } = req.body;
+  if (password === ADMIN_PASSWORD) {
+    // Token is just the password itself for simplicity — kept secret via HTTPS
+    res.json({ success: true, token: ADMIN_PASSWORD });
+  } else {
+    res.status(401).json({ error: 'Incorrect password' });
+  }
+});
+
+app.use('/api', (req, res, next) => {
+  if (req.path === '/login' || req.path === '/debug') return next();
+  const token = req.headers['x-admin-token'];
+  if (token !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*' }
