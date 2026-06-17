@@ -36,6 +36,18 @@ function getInitialTheme() {
   return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
 }
 
+// ── Quick-tap service presets ──
+// Edit this list to add, remove, or change default points for any service.
+// "points" is just a starting suggestion — it's always editable before applying.
+const SERVICE_PRESETS = [
+  { label: 'Auto Suction Door', points: 200 },
+  { label: 'LED Install', points: 150 },
+  { label: 'Soundproofing', points: 300 },
+  { label: 'Audio System', points: 400 },
+  { label: '360 Camera', points: 250 },
+  { label: 'Custom', points: '' },
+];
+
 let _setToast = () => {};
 function toast(msg, type = 'success') { _setToast({ msg, type, id: Date.now() }); }
 
@@ -186,6 +198,72 @@ function ThemeToggle({ theme, themeName, onToggle }) {
   );
 }
 
+// ── Quick-tap points panel with service presets ──
+function PointsPanel({ memberId, theme, pointsValue, descriptionValue, onPointsChange, onDescriptionChange, onApply }) {
+  const [selectedPreset, setSelectedPreset] = useState(null);
+
+  const choosePreset = (preset) => {
+    setSelectedPreset(preset.label);
+    onDescriptionChange(preset.label === 'Custom' ? '' : preset.label);
+    if (preset.points !== '') onPointsChange(String(preset.points));
+  };
+
+  return (
+    <div style={{
+      marginTop: 14, paddingTop: 14, borderTop: `1px solid ${theme.border}`,
+      animation: 'fadeIn 0.2s ease both',
+    }}>
+      <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 2, marginBottom: 10, textTransform: 'uppercase' }}>
+        Quick-Tap Service
+      </div>
+
+      {/* preset buttons */}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
+        {SERVICE_PRESETS.map(preset => {
+          const isActive = selectedPreset === preset.label;
+          return (
+            <button
+              key={preset.label}
+              onClick={() => choosePreset(preset)}
+              style={{
+                padding: '8px 14px', borderRadius: 8, fontSize: 13,
+                fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
+                cursor: 'pointer', whiteSpace: 'nowrap',
+                border: `1px solid ${isActive ? theme.accent : theme.border}`,
+                background: isActive ? `${theme.accent}18` : theme.inputBg,
+                color: isActive ? theme.accent : theme.textDim,
+                transition: 'all 0.15s ease',
+              }}
+            >
+              {preset.label}{preset.points !== '' ? ` · ${preset.points}` : ''}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* description + points + apply */}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+        <input
+          type="text"
+          placeholder="Description (e.g. LED Install)"
+          value={descriptionValue}
+          onChange={e => { onDescriptionChange(e.target.value); setSelectedPreset(null); }}
+          style={inputStyle(theme, { flex: '2 1 180px' })}
+        />
+        <input
+          type="number"
+          placeholder="Points +/-"
+          value={pointsValue}
+          onChange={e => onPointsChange(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && onApply()}
+          style={inputStyle(theme, { width: 110, textAlign: 'center' })}
+        />
+        <button onClick={onApply} style={btnStyle(theme.accent, theme.bg)}>Apply</button>
+      </div>
+    </div>
+  );
+}
+
 // ── Transaction History Drawer ──
 function HistoryDrawer({ memberId, isOpen, transactions, loading, theme }) {
   if (!isOpen) return null;
@@ -330,6 +408,8 @@ export default function App() {
   const [newPlate, setNewPlate] = useState('');
   const [newModel, setNewModel] = useState('');
   const [adjustments, setAdjustments] = useState({});
+  const [descriptions, setDescriptions] = useState({});      // { [memberId]: 'LED Install' }
+  const [openPointsPanel, setOpenPointsPanel] = useState(null); // memberId currently showing presets
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
   const [registering, setRegistering] = useState(false);
@@ -418,13 +498,16 @@ export default function App() {
   const handleUpdatePoints = async (id) => {
     const pts = parseInt(adjustments[id], 10);
     if (isNaN(pts)) { toast('Enter a number first', 'warn'); return; }
+    const description = (descriptions[id] || '').trim() || 'Manual Adjustment';
     try {
       await apiFetch('/api/add-points', {
         method: 'POST',
-        body: JSON.stringify({ memberId: id, points: pts, description: 'Manual Adjustment' }),
+        body: JSON.stringify({ memberId: id, points: pts, description }),
       });
-      toast(`${pts >= 0 ? '+' : ''}${pts} pts applied`);
+      toast(`${pts >= 0 ? '+' : ''}${pts} pts · ${description}`);
       setAdjustments(prev => ({ ...prev, [id]: '' }));
+      setDescriptions(prev => ({ ...prev, [id]: '' }));
+      setOpenPointsPanel(null);
     } catch (err) {
       toast(`Points update failed: ${err.message}`, 'error');
     }
@@ -621,17 +704,27 @@ export default function App() {
 
                     {/* CONTROLS */}
                     <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                      <input
-                        type="number" placeholder="+/-"
-                        value={adjustments[member.member_id] || ''}
-                        onChange={e => setAdjustments(prev => ({ ...prev, [member.member_id]: e.target.value }))}
-                        onKeyDown={e => e.key === 'Enter' && handleUpdatePoints(member.member_id)}
-                        style={inputStyle(theme, { width: 80, textAlign: 'center', padding: '9px 8px' })}
-                      />
-                      <button onClick={() => handleUpdatePoints(member.member_id)} style={btnStyle('#3b82f6', '#fff')}>Apply</button>
+                      <button
+                        onClick={() => setOpenPointsPanel(prev => prev === member.member_id ? null : member.member_id)}
+                        style={btnStyle('#3b82f6', '#fff')}
+                      >
+                        {openPointsPanel === member.member_id ? 'Close' : '＋ Add Points'}
+                      </button>
                       <button onClick={() => handleDeleteMember(member.member_id, member.full_name)} style={btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455' })}>Delete</button>
                     </div>
                   </div>
+
+                  {openPointsPanel === member.member_id && (
+                    <PointsPanel
+                      memberId={member.member_id}
+                      theme={theme}
+                      pointsValue={adjustments[member.member_id] || ''}
+                      descriptionValue={descriptions[member.member_id] || ''}
+                      onPointsChange={v => setAdjustments(prev => ({ ...prev, [member.member_id]: v }))}
+                      onDescriptionChange={v => setDescriptions(prev => ({ ...prev, [member.member_id]: v }))}
+                      onApply={() => handleUpdatePoints(member.member_id)}
+                    />
+                  )}
 
                   {/* HISTORY TOGGLE */}
                   <div style={{ marginTop: 12 }}>
