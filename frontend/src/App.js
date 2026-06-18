@@ -40,11 +40,11 @@ function getInitialTheme() {
 // Edit this list to add, remove, or change default points for any service.
 // "points" is just a starting suggestion — it's always editable before applying.
 const SERVICE_PRESETS = [
-  { label: 'Auto Suction Door', points: 200 },
-  { label: 'LED Install', points: 150 },
-  { label: 'Soundproofing', points: 300 },
-  { label: 'Audio System', points: 400 },
-  { label: '360 Camera', points: 250 },
+  { label: 'Auto Suction Door', points: '' },
+  { label: 'LED Install', points: '' },
+  { label: 'Soundproofing', points: '' },
+  { label: 'Audio System', points: '' },
+  { label: '360 Camera', points: '' },
   { label: 'Custom', points: '' },
 ];
 
