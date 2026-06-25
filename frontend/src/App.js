@@ -40,12 +40,22 @@ function getInitialTheme() {
 // Edit this list to add, remove, or change default points for any service.
 // "points" is just a starting suggestion — it's always editable before applying.
 const SERVICE_PRESETS = [
-  { label: 'Auto Suction Door', points: '' },
-  { label: 'LED Install', points: '' },
-  { label: 'Soundproofing', points: '' },
-  { label: 'Audio System', points: '' },
-  { label: '360 Camera', points: '' },
+  { label: 'Auto Suction Door', points: 200 },
+  { label: 'LED Install', points: 150 },
+  { label: 'Soundproofing', points: 300 },
+  { label: 'Audio System', points: 400 },
+  { label: '360 Camera', points: 250 },
   { label: 'Custom', points: '' },
+];
+
+// ── Redeem presets (negative points = deductions) ──
+const REDEEM_PRESETS = [
+  { label: '$5 Off', points: -50 },
+  { label: '$10 Off', points: -100 },
+  { label: '$20 Off', points: -200 },
+  { label: '$50 Off', points: -500 },
+  { label: 'Free Gift', points: -100 },
+  { label: 'Custom Redeem', points: '' },
 ];
 
 let _setToast = () => {};
@@ -200,12 +210,25 @@ function ThemeToggle({ theme, themeName, onToggle }) {
 
 // ── Quick-tap points panel with service presets ──
 function PointsPanel({ memberId, theme, pointsValue, descriptionValue, onPointsChange, onDescriptionChange, onApply }) {
+  const [tab, setTab] = useState('earn'); // 'earn' | 'redeem'
   const [selectedPreset, setSelectedPreset] = useState(null);
+
+  const isRedeem = tab === 'redeem';
+  const presets = isRedeem ? REDEEM_PRESETS : SERVICE_PRESETS;
+  const tabAccent = isRedeem ? '#ef4444' : theme.accent;
 
   const choosePreset = (preset) => {
     setSelectedPreset(preset.label);
-    onDescriptionChange(preset.label === 'Custom' ? '' : preset.label);
+    const isCustom = preset.label === 'Custom' || preset.label === 'Custom Redeem';
+    onDescriptionChange(isCustom ? '' : preset.label);
     if (preset.points !== '') onPointsChange(String(preset.points));
+  };
+
+  const switchTab = (t) => {
+    setTab(t);
+    setSelectedPreset(null);
+    onPointsChange('');
+    onDescriptionChange('');
   };
 
   return (
@@ -213,13 +236,32 @@ function PointsPanel({ memberId, theme, pointsValue, descriptionValue, onPointsC
       marginTop: 14, paddingTop: 14, borderTop: `1px solid ${theme.border}`,
       animation: 'fadeIn 0.2s ease both',
     }}>
-      <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 2, marginBottom: 10, textTransform: 'uppercase' }}>
-        Quick-Tap Service
+
+      {/* ── tab switcher ── */}
+      <div style={{ display: 'flex', gap: 0, marginBottom: 14, background: theme.inputBg, borderRadius: 8, padding: 3, border: `1px solid ${theme.border}`, width: 'fit-content' }}>
+        {[['earn', '＋ Earn Points'], ['redeem', '− Redeem Points']].map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => switchTab(key)}
+            style={{
+              padding: '7px 16px', borderRadius: 6, fontSize: 12, fontWeight: 700,
+              fontFamily: "'JetBrains Mono', monospace", cursor: 'pointer', border: 'none',
+              background: tab === key ? (key === 'redeem' ? '#ef4444' : theme.accent) : 'transparent',
+              color: tab === key ? (key === 'redeem' ? '#fff' : theme.bg) : theme.textDim,
+              transition: 'all 0.15s ease',
+            }}
+          >{label}</button>
+        ))}
       </div>
 
-      {/* preset buttons */}
+      {/* ── preset label ── */}
+      <div style={{ fontSize: 11, color: tabAccent, letterSpacing: 2, marginBottom: 10, textTransform: 'uppercase' }}>
+        {isRedeem ? 'Redeem Presets' : 'Quick-Tap Service'}
+      </div>
+
+      {/* ── preset buttons ── */}
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
-        {SERVICE_PRESETS.map(preset => {
+        {presets.map(preset => {
           const isActive = selectedPreset === preset.label;
           return (
             <button
@@ -229,9 +271,9 @@ function PointsPanel({ memberId, theme, pointsValue, descriptionValue, onPointsC
                 padding: '8px 14px', borderRadius: 8, fontSize: 13,
                 fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
                 cursor: 'pointer', whiteSpace: 'nowrap',
-                border: `1px solid ${isActive ? theme.accent : theme.border}`,
-                background: isActive ? `${theme.accent}18` : theme.inputBg,
-                color: isActive ? theme.accent : theme.textDim,
+                border: `1px solid ${isActive ? tabAccent : theme.border}`,
+                background: isActive ? `${tabAccent}18` : theme.inputBg,
+                color: isActive ? tabAccent : theme.textDim,
                 transition: 'all 0.15s ease',
               }}
             >
@@ -241,25 +283,38 @@ function PointsPanel({ memberId, theme, pointsValue, descriptionValue, onPointsC
         })}
       </div>
 
-      {/* description + points + apply */}
+      {/* ── description + points + apply ── */}
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
         <input
           type="text"
-          placeholder="Description (e.g. LED Install)"
+          placeholder={isRedeem ? 'Redemption description…' : 'Description (e.g. LED Install)'}
           value={descriptionValue}
           onChange={e => { onDescriptionChange(e.target.value); setSelectedPreset(null); }}
           style={inputStyle(theme, { flex: '2 1 180px' })}
         />
         <input
           type="number"
-          placeholder="Points +/-"
+          placeholder={isRedeem ? 'Points to deduct' : 'Points to add'}
           value={pointsValue}
           onChange={e => onPointsChange(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && onApply()}
-          style={inputStyle(theme, { width: 110, textAlign: 'center' })}
+          style={inputStyle(theme, { width: 130, textAlign: 'center',
+            color: isRedeem && pointsValue && parseInt(pointsValue) < 0 ? '#ef4444' : theme.text,
+          })}
         />
-        <button onClick={onApply} style={btnStyle(theme.accent, theme.bg)}>Apply</button>
+        <button
+          onClick={onApply}
+          style={btnStyle(isRedeem ? '#ef4444' : theme.accent, isRedeem ? '#fff' : theme.bg)}
+        >
+          {isRedeem ? 'Redeem' : 'Apply'}
+        </button>
       </div>
+
+      {isRedeem && (
+        <p style={{ marginTop: 10, fontSize: 11, color: theme.textFaint }}>
+          💡 Enter a negative number to deduct (e.g. -100), or tap a preset above.
+        </p>
+      )}
     </div>
   );
 }
