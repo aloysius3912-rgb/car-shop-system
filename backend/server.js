@@ -123,6 +123,23 @@ app.post('/api/add-points', async (req, res) => {
   const { memberId, points, description } = req.body;
   const numericPoints = parseInt(points, 10) || 0;
   try {
+    // ── Guard: fetch current points first if this is a deduction ──
+    if (numericPoints < 0) {
+      const check = await pool.query(
+        'SELECT total_points FROM members WHERE member_id = $1',
+        [memberId]
+      );
+      if (check.rows.length === 0) {
+        return res.status(404).json({ error: 'Member not found' });
+      }
+      const current = check.rows[0].total_points || 0;
+      if (current + numericPoints < 0) {
+        return res.status(400).json({
+          error: `Not enough points! Member has ${current} pts, cannot deduct ${Math.abs(numericPoints)} pts.`,
+        });
+      }
+    }
+
     const result = await pool.query(
       'UPDATE members SET total_points = COALESCE(total_points, 0) + $1 WHERE member_id = $2 RETURNING total_points',
       [numericPoints, memberId]

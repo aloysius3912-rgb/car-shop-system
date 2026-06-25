@@ -553,6 +553,17 @@ export default function App() {
   const handleUpdatePoints = async (id) => {
     const pts = parseInt(adjustments[id], 10);
     if (isNaN(pts)) { toast('Enter a number first', 'warn'); return; }
+
+    // ── Guard: prevent redemption taking member below 0 ──
+    if (pts < 0) {
+      const member = members.find(raw => norm(raw).member_id == id);
+      const currentPoints = member ? (norm(member).total_points ?? 0) : 0;
+      if (currentPoints + pts < 0) {
+        toast(`Not enough points! ${currentPoints} pts available, need ${Math.abs(pts)} pts.`, 'error');
+        return;
+      }
+    }
+
     const description = (descriptions[id] || '').trim() || 'Manual Adjustment';
     try {
       await apiFetch('/api/add-points', {
