@@ -131,6 +131,91 @@ function ConfirmDialog({ name, onConfirm, onCancel, theme }) {
   );
 }
 
+// ── Change Password Modal ──
+function ChangePasswordModal({ onClose, theme }) {
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError('');
+
+    if (newPassword.length < 4) {
+      setError('New password must be at least 4 characters.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setError('New passwords do not match.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const data = await apiFetch('/api/change-password', {
+        method: 'POST',
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      // Token changes when password changes — update it so the session stays valid
+      localStorage.setItem('carshop_token', data.token);
+      toast('✅ Password changed successfully!');
+      onClose();
+    } catch (err) {
+      setError(err.message || 'Could not change password.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 8888,
+    }}>
+      <form onSubmit={handleSubmit} style={{
+        background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14,
+        padding: '32px 36px', maxWidth: 380, width: '90%',
+        fontFamily: "'JetBrains Mono', monospace",
+      }}>
+        <h3 style={{ color: theme.text, margin: '0 0 18px', fontSize: 18, fontFamily: "'Space Grotesk', sans-serif" }}>
+          Change Password
+        </h3>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 14 }}>
+          <input
+            type="password" placeholder="Current password" value={currentPassword}
+            onChange={e => setCurrentPassword(e.target.value)} required autoFocus
+            style={inputStyle(theme, { width: '100%' })}
+          />
+          <input
+            type="password" placeholder="New password" value={newPassword}
+            onChange={e => setNewPassword(e.target.value)} required
+            style={inputStyle(theme, { width: '100%' })}
+          />
+          <input
+            type="password" placeholder="Retype new password" value={confirmPassword}
+            onChange={e => setConfirmPassword(e.target.value)} required
+            style={inputStyle(theme, { width: '100%' })}
+          />
+        </div>
+
+        {error && (
+          <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>
+        )}
+
+        <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
+          <button type="button" onClick={onClose} style={btnStyle('#374151', '#fff')}>Cancel</button>
+          <button type="submit" disabled={loading} style={{ ...btnStyle(theme.accent, theme.bg), opacity: loading ? 0.6 : 1 }}>
+            {loading ? 'Saving…' : 'Save Password'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 const btnStyle = (bg, color, extra = {}) => ({
   padding: '10px 22px', borderRadius: 8, border: 'none', cursor: 'pointer',
   background: bg, color, fontWeight: 700, fontSize: 14,
@@ -470,6 +555,7 @@ export default function App() {
   const [registering, setRegistering] = useState(false);
   const [connected, setConnected] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
+  const [showChangePassword, setShowChangePassword] = useState(false);
   const [serverWaking, setServerWaking] = useState(false);
 
   // History drawer state
@@ -643,6 +729,7 @@ export default function App() {
 
       <Toast />
       {confirmDelete && <ConfirmDialog name={confirmDelete.name} onConfirm={confirmDeleteMember} onCancel={() => setConfirmDelete(null)} theme={theme} />}
+      {showChangePassword && <ChangePasswordModal onClose={() => setShowChangePassword(false)} theme={theme} />}
 
       <div style={{ maxWidth: 900, margin: '0 auto', padding: '40px 20px', fontFamily: "'JetBrains Mono', monospace" }}>
 
@@ -658,14 +745,24 @@ export default function App() {
             <ThemeToggle theme={theme} themeName={themeName} onToggle={toggleTheme} />
             <StatusBadge connected={connected} />
             <span style={{ fontSize: 11, color: theme.textFaint }}>{filteredMembers.length} member{filteredMembers.length !== 1 ? 's' : ''}</span>
-            <button
-              onClick={() => { localStorage.removeItem('carshop_token'); setAuthed(false); }}
-              style={{
-                background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint,
-                fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1,
-                padding: '4px 10px', borderRadius: 6, cursor: 'pointer',
-              }}
-            >Lock</button>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button
+                onClick={() => setShowChangePassword(true)}
+                style={{
+                  background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint,
+                  fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1,
+                  padding: '4px 10px', borderRadius: 6, cursor: 'pointer',
+                }}
+              >Settings</button>
+              <button
+                onClick={() => { localStorage.removeItem('carshop_token'); setAuthed(false); }}
+                style={{
+                  background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint,
+                  fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1,
+                  padding: '4px 10px', borderRadius: 6, cursor: 'pointer',
+                }}
+              >Lock</button>
+            </div>
           </div>
         </div>
 

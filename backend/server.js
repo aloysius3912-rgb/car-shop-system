@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const { Pool } = require('pg');
 const cors = require('cors');
+const bcrypt = require('bcryptjs');
 
 const app = express();
 
@@ -15,11 +16,63 @@ const ALLOWED_ORIGINS = [
 app.use(cors({ origin: ALLOWED_ORIGINS }));
 app.use(express.json());
 
-// ── Simple password gate ──
-// Set ADMIN_PASSWORD in Render's Environment tab.
-// All /api routes (except /api/login and health check) require the
-// 'x-admin-token' header to match ADMIN_PASSWORD.
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: ALLOWED_ORIGINS }
+});
+
+const pool = new Pool(
+  process.env.DATABASE_URL
+    ? {
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+        connectionTimeoutMillis: 10000,
+      }
+    : {
+        user: 'postgres',
+        host: 'localhost',
+        database: 'postgres',
+        password: process.env.LOCAL_DB_PASSWORD || 'changeme-local-only',
+        port: 5432,
+      }
+);
+
+// ── Password storage ──
+// The admin password is stored (hashed) in a 'settings' table in the database,
+// so it can be changed from the website itself. On first run, it's seeded from
+// the ADMIN_PASSWORD environment variable (or 'changeme' if that's not set).
+const FALLBACK_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
+
+async function ensureSettingsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
+  const existing = await pool.query("SELECT value FROM settings WHERE key = 'admin_password_hash'");
+  if (existing.rows.length === 0) {
+    const hash = await bcrypt.hash(FALLBACK_PASSWORD, 10);
+    await pool.query(
+      "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1)",
+      [hash]
+    );
+    console.log('🔑 Seeded initial admin password from ADMIN_PASSWORD env var.');
+  }
+}
+ensureSettingsTable().catch(err => console.error('Settings table setup failed:', err.message));
+
+async function getPasswordHash() {
+  const result = await pool.query("SELECT value FROM settings WHERE key = 'admin_password_hash'");
+  return result.rows[0]?.value || null;
+}
+
+async function setPasswordHash(newHash) {
+  await pool.query(
+    "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
+    [newHash]
+  );
+}
 
 // ── Simple rate limiter for /api/login (5 attempts per 15 min per IP) ──
 const loginAttempts = new Map(); // ip -> { count, resetAt }
@@ -47,45 +100,60 @@ function loginRateLimiter(req, res, next) {
   next();
 }
 
-app.post('/api/login', loginRateLimiter, (req, res) => {
+app.post('/api/login', loginRateLimiter, async (req, res) => {
   const { password } = req.body;
-  if (password === ADMIN_PASSWORD) {
-    // Token is just the password itself for simplicity — kept secret via HTTPS
-    res.json({ success: true, token: ADMIN_PASSWORD });
-  } else {
-    res.status(401).json({ error: 'Incorrect password' });
+  try {
+    const hash = await getPasswordHash();
+    if (!hash) return res.status(500).json({ error: 'Password not set up yet. Try again shortly.' });
+
+    const match = await bcrypt.compare(password || '', hash);
+    if (match) {
+      // Token is the current hash — changes automatically when password changes,
+      // which invalidates old sessions naturally.
+      res.json({ success: true, token: hash });
+    } else {
+      res.status(401).json({ error: 'Incorrect password' });
+    }
+  } catch (err) {
+    console.error('POST /api/login error:', err.message);
+    res.status(500).json({ error: 'Login failed. Try again.' });
   }
 });
 
-app.use('/api', (req, res, next) => {
+app.use('/api', async (req, res, next) => {
   if (req.path === '/login') return next();
-  const token = req.headers['x-admin-token'];
-  if (token !== ADMIN_PASSWORD) {
-    return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const hash = await getPasswordHash();
+    const token = req.headers['x-admin-token'];
+    if (!hash || token !== hash) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+  } catch (err) {
+    res.status(500).json({ error: 'Auth check failed' });
   }
-  next();
 });
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: ALLOWED_ORIGINS }
+// ── Change password (requires current valid token, already enforced above) ──
+app.post('/api/change-password', async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!newPassword || newPassword.length < 4) {
+    return res.status(400).json({ error: 'New password must be at least 4 characters.' });
+  }
+  try {
+    const hash = await getPasswordHash();
+    const match = await bcrypt.compare(currentPassword || '', hash);
+    if (!match) {
+      return res.status(401).json({ error: 'Current password is incorrect.' });
+    }
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await setPasswordHash(newHash);
+    res.json({ success: true, token: newHash });
+  } catch (err) {
+    console.error('POST /api/change-password error:', err.message);
+    res.status(500).json({ error: 'Could not change password.' });
+  }
 });
-
-const pool = new Pool(
-  process.env.DATABASE_URL
-    ? {
-        connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false },
-        connectionTimeoutMillis: 10000,
-      }
-    : {
-        user: 'postgres',
-        host: 'localhost',
-        database: 'postgres',
-        password: process.env.LOCAL_DB_PASSWORD || 'changeme-local-only',
-        port: 5432,
-      }
-);
 
 // ── Health check
 app.get('/', (req, res) => {
