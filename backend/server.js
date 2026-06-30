@@ -82,7 +82,7 @@ const pool = new Pool(
         user: 'postgres',
         host: 'localhost',
         database: 'postgres',
-        password: 'supersecret',
+        password: process.env.LOCAL_DB_PASSWORD || 'changeme-local-only',
         port: 5432,
       }
 );
