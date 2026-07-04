@@ -276,36 +276,58 @@ app.delete('/api/delete-car/:carId', async (req, res) => {
 app.post('/api/add-points', async (req, res) => {
   const { memberId, points, description } = req.body;
   const numericPoints = parseInt(points, 10) || 0;
-  try {
-    // Guard: prevent negative total
-    if (numericPoints < 0) {
-      const check = await pool.query('SELECT total_points FROM members WHERE member_id = $1', [memberId]);
-      if (check.rows.length === 0) return res.status(404).json({ error: 'Member not found' });
-      const current = check.rows[0].total_points || 0;
-      if (current + numericPoints < 0) {
-        return res.status(400).json({
-          error: `Not enough points! Member has ${current} pts, cannot deduct ${Math.abs(numericPoints)} pts.`,
-        });
-      }
-    }
 
-    const result = await pool.query(
-      'UPDATE members SET total_points = COALESCE(total_points, 0) + $1 WHERE member_id = $2 RETURNING total_points',
+  // Everything runs on ONE client inside a transaction so the balance
+  // update and the history log either both happen or neither does.
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Atomic conditional update: the WHERE clause enforces "never below zero"
+    // in the same statement as the update, so concurrent requests can't
+    // both slip past a separate balance check (no check-then-act race).
+    const result = await client.query(
+      `UPDATE members
+         SET total_points = COALESCE(total_points, 0) + $1
+       WHERE member_id = $2
+         AND COALESCE(total_points, 0) + $1 >= 0
+       RETURNING total_points`,
       [numericPoints, memberId]
     );
 
-    const txResult = await pool.query(
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      // Distinguish "member missing" from "not enough points" for a clear message
+      const check = await pool.query(
+        'SELECT total_points FROM members WHERE member_id = $1',
+        [memberId]
+      );
+      if (check.rows.length === 0) {
+        return res.status(404).json({ error: 'Member not found' });
+      }
+      const current = check.rows[0].total_points || 0;
+      return res.status(400).json({
+        error: `Not enough points! Member has ${current} pts, cannot deduct ${Math.abs(numericPoints)} pts.`,
+      });
+    }
+
+    const txResult = await client.query(
       'INSERT INTO point_transactions (member_id, points_added, description) VALUES ($1, $2, $3) RETURNING transaction_id, points_added, description, transaction_date',
       [memberId, numericPoints, description]
     );
+
+    await client.query('COMMIT');
 
     const newTotal = result.rows[0].total_points;
     io.emit('pointsUpdated', { memberId, newTotal });
     io.emit('transactionAdded', { memberId, transaction: txResult.rows[0] });
     res.json({ success: true, newTotal });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('POST /api/add-points error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Could not update points. Please try again.' });
+  } finally {
+    client.release();
   }
 });
 
