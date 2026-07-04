@@ -176,7 +176,7 @@ function ChangePasswordModal({ onClose, theme }) {
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
-    if (newPassword.length < 4) { setError('New password must be at least 4 characters.'); return; }
+    if (newPassword.length < 10) { setError('New password must be at least 10 characters.'); return; }
     if (newPassword !== confirmPassword) { setError('New passwords do not match.'); return; }
     setLoading(true);
     try {

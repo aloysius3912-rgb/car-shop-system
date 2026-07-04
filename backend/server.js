@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const { Pool } = require('pg');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -36,14 +37,21 @@ const pool = new Pool(
       }
 );
 
-// ── Password storage ──
+// ── Password + session storage ──
 const FALLBACK_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
+const SESSION_TTL_HOURS = 12;
 
-async function ensureSettingsTable() {
+async function ensureAuthTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      expires_at TIMESTAMP NOT NULL
     );
   `);
   const existing = await pool.query("SELECT value FROM settings WHERE key = 'admin_password_hash'");
@@ -56,11 +64,17 @@ async function ensureSettingsTable() {
     console.log('🔑 Seeded initial admin password from ADMIN_PASSWORD env var.');
   }
 }
-ensureSettingsTable().catch(err => console.error('Settings table setup failed:', err.message));
+ensureAuthTables().catch(err => console.error('Auth tables setup failed:', err.message));
+
+// Cache the hash in memory so the auth middleware doesn't hit the DB
+// on every single request. Invalidated whenever the password changes.
+let _cachedHash = null;
 
 async function getPasswordHash() {
+  if (_cachedHash) return _cachedHash;
   const result = await pool.query("SELECT value FROM settings WHERE key = 'admin_password_hash'");
-  return result.rows[0]?.value || null;
+  _cachedHash = result.rows[0]?.value || null;
+  return _cachedHash;
 }
 
 async function setPasswordHash(newHash) {
@@ -68,7 +82,34 @@ async function setPasswordHash(newHash) {
     "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
     [newHash]
   );
+  _cachedHash = newHash;
+  // Changing the password invalidates every existing session.
+  await pool.query('DELETE FROM sessions');
 }
+
+// ── Session helpers ──
+async function createSession() {
+  const token = crypto.randomUUID() + crypto.randomUUID(); // 72 chars of randomness
+  await pool.query(
+    "INSERT INTO sessions (token, expires_at) VALUES ($1, NOW() + ($2 || ' hours')::interval)",
+    [token, String(SESSION_TTL_HOURS)]
+  );
+  return token;
+}
+
+async function isValidSession(token) {
+  if (!token) return false;
+  const result = await pool.query(
+    'SELECT 1 FROM sessions WHERE token = $1 AND expires_at > NOW()',
+    [token]
+  );
+  return result.rows.length > 0;
+}
+
+// Clean out expired sessions occasionally (every hour)
+setInterval(() => {
+  pool.query('DELETE FROM sessions WHERE expires_at <= NOW()').catch(() => {});
+}, 60 * 60 * 1000);
 
 // ── Rate limiter for /api/login ──
 const loginAttempts = new Map();
@@ -98,7 +139,8 @@ app.post('/api/login', loginRateLimiter, async (req, res) => {
     if (!hash) return res.status(500).json({ error: 'Password not set up yet. Try again shortly.' });
     const match = await bcrypt.compare(password || '', hash);
     if (match) {
-      res.json({ success: true, token: hash });
+      const token = await createSession();
+      res.json({ success: true, token, expiresInHours: SESSION_TTL_HOURS });
     } else {
       res.status(401).json({ error: 'Incorrect password' });
     }
@@ -111,9 +153,8 @@ app.post('/api/login', loginRateLimiter, async (req, res) => {
 app.use('/api', async (req, res, next) => {
   if (req.path === '/login') return next();
   try {
-    const hash = await getPasswordHash();
     const token = req.headers['x-admin-token'];
-    if (!hash || token !== hash) {
+    if (!(await isValidSession(token))) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     next();
@@ -130,16 +171,17 @@ app.get('/', (req, res) => {
 // ── Change password ──
 app.post('/api/change-password', async (req, res) => {
   const { currentPassword, newPassword } = req.body;
-  if (!newPassword || newPassword.length < 4) {
-    return res.status(400).json({ error: 'New password must be at least 4 characters.' });
+  if (!newPassword || newPassword.length < 10) {
+    return res.status(400).json({ error: 'New password must be at least 10 characters.' });
   }
   try {
     const hash = await getPasswordHash();
     const match = await bcrypt.compare(currentPassword || '', hash);
     if (!match) return res.status(401).json({ error: 'Current password is incorrect.' });
-    const newHash = await bcrypt.hash(newPassword, 10);
-    await setPasswordHash(newHash);
-    res.json({ success: true, token: newHash });
+    const newHash = await bcrypt.hash(newPassword, 12);
+    await setPasswordHash(newHash); // also wipes all existing sessions
+    const token = await createSession(); // fresh session for this user
+    res.json({ success: true, token });
   } catch (err) {
     console.error('POST /api/change-password error:', err.message);
     res.status(500).json({ error: 'Could not change password.' });
