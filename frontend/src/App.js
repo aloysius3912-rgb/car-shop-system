@@ -782,6 +782,63 @@ function TrashPanel({ theme, onClose, onRestored }) {
   );
 }
 
+// ── Account dropdown menu (Change Password, Staff, Lock) ──
+function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onLock }) {
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    window.addEventListener('click', close);
+    return () => window.removeEventListener('click', close);
+  }, [open]);
+
+  const item = (label, onClick, danger = false) => (
+    <button
+      onClick={() => { setOpen(false); onClick(); }}
+      style={{
+        display: 'block', width: '100%', textAlign: 'left',
+        background: 'none', border: 'none', cursor: 'pointer',
+        fontFamily: "'JetBrains Mono', monospace", fontSize: 12,
+        padding: '9px 14px', color: danger ? '#ef4444' : theme.text,
+      }}
+      onMouseEnter={e => e.currentTarget.style.background = theme.inputBg}
+      onMouseLeave={e => e.currentTarget.style.background = 'none'}
+    >{label}</button>
+  );
+
+  return (
+    <div style={{ position: 'relative' }} onClick={e => e.stopPropagation()}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{
+          background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint,
+          fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1,
+          padding: '4px 12px', borderRadius: 6, cursor: 'pointer',
+          display: 'flex', alignItems: 'center', gap: 6,
+        }}
+      >
+        Account <span style={{ fontSize: 9, transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>▼</span>
+      </button>
+
+      {open && (
+        <div style={{
+          position: 'absolute', top: '100%', right: 0, marginTop: 6,
+          background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 8,
+          minWidth: 170, zIndex: 100, overflow: 'hidden',
+          boxShadow: '0 6px 24px rgba(0,0,0,0.3)',
+          animation: 'fadeIn 0.12s ease both',
+        }}>
+          {item('🔑 Change Password', onChangePassword)}
+          {isAdmin && item('👥 Manage Staff', onOpenStaff)}
+          <div style={{ height: 1, background: theme.border }} />
+          {item('🔒 Lock', onLock, true)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [authed, setAuthed] = useState(!!localStorage.getItem('carshop_token'));
   const [userRole, setUserRole] = useState(localStorage.getItem('carshop_role') || '');
@@ -1020,14 +1077,16 @@ export default function App() {
               👤 {userName} · <span style={{ color: isAdmin ? '#f59e0b' : theme.accent }}>{userRole}</span>
             </span>
             <div style={{ display: 'flex', gap: 6 }}>
-              {isAdmin && (
-                <button onClick={() => setShowStaffPanel(true)} style={{ background: 'none', border: `1px solid ${theme.accent}`, color: theme.accent, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Staff</button>
-              )}
               {can('can_delete_member') && (
                 <button onClick={() => setShowTrash(true)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>🗑️ Trash</button>
               )}
-              <button onClick={() => setShowChangePassword(true)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Settings</button>
-              <button onClick={() => { localStorage.removeItem('carshop_token'); localStorage.removeItem('carshop_role'); localStorage.removeItem('carshop_username'); setAuthed(false); }} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Lock</button>
+              <AccountMenu
+                theme={theme}
+                isAdmin={isAdmin}
+                onChangePassword={() => setShowChangePassword(true)}
+                onOpenStaff={() => setShowStaffPanel(true)}
+                onLock={() => { localStorage.removeItem('carshop_token'); localStorage.removeItem('carshop_role'); localStorage.removeItem('carshop_username'); setAuthed(false); }}
+              />
             </div>
           </div>
         </div>
