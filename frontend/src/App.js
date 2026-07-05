@@ -700,6 +700,88 @@ function StaffPanel({ theme, currentUserId, onClose }) {
   );
 }
 
+// ── Trash Bin panel ──
+function TrashPanel({ theme, onClose, onRestored }) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const data = await apiFetch('/api/trash');
+      setItems(Array.isArray(data) ? data : []);
+    } catch (err) {
+      toast(`Could not load trash: ${err.message}`, 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { load(); }, []);
+
+  const restore = async (m) => {
+    try {
+      await apiFetch(`/api/restore-member/${m.member_id}`, { method: 'POST' });
+      toast(`♻️ ${m.full_name} restored.`);
+      setItems(prev => prev.filter(i => i.member_id !== m.member_id));
+      onRestored?.();
+    } catch (err) {
+      toast(`Restore failed: ${err.message}`, 'error');
+    }
+  };
+
+  const purge = async (m) => {
+    if (!window.confirm(`Permanently delete ${m.full_name}? This CANNOT be undone.`)) return;
+    try {
+      await apiFetch(`/api/purge-member/${m.member_id}`, { method: 'DELETE' });
+      toast(`${m.full_name} permanently deleted.`, 'warn');
+      setItems(prev => prev.filter(i => i.member_id !== m.member_id));
+    } catch (err) {
+      toast(`Delete failed: ${err.message}`, 'error');
+    }
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', zIndex: 8888, padding: 20, overflowY: 'auto' }}>
+      <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '28px 30px', maxWidth: 620, width: '100%', margin: '40px 0', fontFamily: "'JetBrains Mono', monospace" }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+          <h3 style={{ color: theme.text, fontSize: 20, fontFamily: "'Space Grotesk', sans-serif", margin: 0 }}>🗑️ Trash Bin</h3>
+          <button onClick={onClose} style={btnStyle('#374151', '#fff', { padding: '6px 14px' })}>Close</button>
+        </div>
+        <p style={{ color: theme.textFaint, fontSize: 12, marginBottom: 20 }}>Deleted customers are kept for 30 days, then permanently removed automatically.</p>
+
+        {loading ? (
+          <p style={{ color: theme.textFaint, fontSize: 14 }}>Loading…</p>
+        ) : items.length === 0 ? (
+          <p style={{ color: theme.textFaint, fontSize: 14, textAlign: 'center', padding: '30px 0' }}>Trash is empty. 🎉</p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {items.map(m => (
+              <div key={m.member_id} style={{ background: theme.inputBg, border: `1px solid ${theme.border}`, borderRadius: 10, padding: '14px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{ fontWeight: 700, color: theme.text }}>{m.full_name}</span>
+                    {(m.cars || [])[0]?.car_plate && (
+                      <span style={{ background: '#f59e0b22', color: '#f59e0b', border: '1px solid #f59e0b55', padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 600, letterSpacing: 1 }}>{m.cars[0].car_plate}</span>
+                    )}
+                    <span style={{ fontSize: 11, color: theme.textDim }}>{m.total_points ?? 0} pts</span>
+                  </div>
+                  <span style={{ fontSize: 11, color: m.days_left <= 5 ? '#ef4444' : theme.textFaint }}>
+                    {m.days_left} day{m.days_left !== 1 ? 's' : ''} left before permanent deletion
+                  </span>
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button onClick={() => restore(m)} style={btnStyle(theme.accent, theme.bg, { padding: '7px 14px', fontSize: 13 })}>♻️ Restore</button>
+                  <button onClick={() => purge(m)} style={btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455', padding: '7px 14px', fontSize: 13 })}>Delete Forever</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [authed, setAuthed] = useState(!!localStorage.getItem('carshop_token'));
   const [userRole, setUserRole] = useState(localStorage.getItem('carshop_role') || '');
@@ -709,6 +791,7 @@ export default function App() {
   const isAdmin = userRole === 'Admin';
   const can = (perm) => isAdmin || (permissions ? !!permissions[perm] : false);
   const [showStaffPanel, setShowStaffPanel] = useState(false);
+  const [showTrash, setShowTrash] = useState(false);
   const [themeName, setThemeName] = useState(getInitialTheme);
   const theme = THEMES[themeName];
 
@@ -909,13 +992,15 @@ export default function App() {
       <Toast />
       {confirmDelete && (
         <ConfirmDialog
-          title="Delete Member?"
-          message={`This will permanently remove ${confirmDelete.name}, all their cars, and all their points.`}
+          title="Move to Trash?"
+          message={`${confirmDelete.name} will be moved to the trash bin. You can restore them within 30 days from the 🗑️ Trash menu.`}
+          confirmLabel="Move to Trash"
           theme={theme} onConfirm={confirmDeleteMember} onCancel={() => setConfirmDelete(null)}
         />
       )}
       {showChangePassword && <ChangePasswordModal onClose={() => setShowChangePassword(false)} theme={theme} />}
       {showStaffPanel && isAdmin && <StaffPanel theme={theme} currentUserId={userId} onClose={() => setShowStaffPanel(false)} />}
+      {showTrash && can('can_delete_member') && <TrashPanel theme={theme} onClose={() => setShowTrash(false)} onRestored={fetchMembers} />}
 
       <div style={{ maxWidth: 900, margin: '0 auto', padding: '40px 20px', fontFamily: "'JetBrains Mono', monospace" }}>
 
@@ -937,6 +1022,9 @@ export default function App() {
             <div style={{ display: 'flex', gap: 6 }}>
               {isAdmin && (
                 <button onClick={() => setShowStaffPanel(true)} style={{ background: 'none', border: `1px solid ${theme.accent}`, color: theme.accent, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Staff</button>
+              )}
+              {can('can_delete_member') && (
+                <button onClick={() => setShowTrash(true)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>🗑️ Trash</button>
               )}
               <button onClick={() => setShowChangePassword(true)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Settings</button>
               <button onClick={() => { localStorage.removeItem('carshop_token'); localStorage.removeItem('carshop_role'); localStorage.removeItem('carshop_username'); setAuthed(false); }} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Lock</button>

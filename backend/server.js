@@ -125,6 +125,25 @@ setInterval(() => {
   pool.query('DELETE FROM sessions WHERE expires_at <= NOW()').catch(() => {});
 }, 60 * 60 * 1000);
 
+// Auto-purge trashed members older than 30 days (runs hourly + once at startup).
+async function purgeOldTrash() {
+  try {
+    const old = await pool.query(
+      "SELECT member_id FROM members WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL '30 days'"
+    );
+    for (const row of old.rows) {
+      await pool.query('DELETE FROM point_transactions WHERE member_id = $1', [row.member_id]);
+      await pool.query('DELETE FROM cars WHERE member_id = $1', [row.member_id]);
+      await pool.query('DELETE FROM members WHERE member_id = $1', [row.member_id]);
+    }
+    if (old.rows.length) console.log(`🗑️  Auto-purged ${old.rows.length} member(s) older than 30 days.`);
+  } catch (err) {
+    console.error('Auto-purge failed:', err.message);
+  }
+}
+setInterval(purgeOldTrash, 60 * 60 * 1000);
+purgeOldTrash();
+
 // ── Socket.IO authentication ──
 io.use(async (socket, next) => {
   try {
@@ -349,7 +368,7 @@ app.delete('/api/staff/:id', requireAdmin, async (req, res) => {
 // ── Fetch ALL members with their cars ──
 app.get('/api/members', async (req, res) => {
   try {
-    const membersResult = await pool.query('SELECT * FROM members ORDER BY full_name ASC');
+    const membersResult = await pool.query('SELECT * FROM members WHERE deleted_at IS NULL ORDER BY full_name ASC');
     const carsResult = await pool.query('SELECT * FROM cars ORDER BY car_id ASC');
 
     // Group cars by member_id
@@ -557,17 +576,76 @@ app.get('/api/transactions/:memberId', async (req, res) => {
 });
 
 // ── Delete a member ──
+// ── Soft delete: move member to the trash bin (reversible for 30 days) ──
 app.delete('/api/delete-member/:id', requirePermission('can_delete_member'), async (req, res) => {
   const memberId = req.params.id;
   try {
-    await pool.query('DELETE FROM point_transactions WHERE member_id = $1', [memberId]);
-    await pool.query('DELETE FROM cars WHERE member_id = $1', [memberId]);
-    await pool.query('DELETE FROM members WHERE member_id = $1', [memberId]);
+    await pool.query('UPDATE members SET deleted_at = NOW() WHERE member_id = $1', [memberId]);
     io.emit('memberDeleted', { memberId: parseInt(memberId) });
     res.json({ success: true });
   } catch (err) {
     console.error('DELETE /api/delete-member error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Could not delete member.' });
+  }
+});
+
+// ── Trash bin: list soft-deleted members (with days remaining) ──
+app.get('/api/trash', requirePermission('can_delete_member'), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT m.*,
+              GREATEST(0, 30 - EXTRACT(DAY FROM NOW() - m.deleted_at))::int AS days_left
+         FROM members m
+        WHERE m.deleted_at IS NOT NULL
+        ORDER BY m.deleted_at DESC`
+    );
+    // attach cars so the trash view can show plates
+    const ids = result.rows.map(r => r.member_id);
+    let carsMap = {};
+    if (ids.length) {
+      const cars = await pool.query('SELECT * FROM cars WHERE member_id = ANY($1)', [ids]);
+      for (const c of cars.rows) {
+        (carsMap[c.member_id] = carsMap[c.member_id] || []).push(c);
+      }
+    }
+    res.json(result.rows.map(m => ({ ...m, cars: carsMap[m.member_id] || [] })));
+  } catch (err) {
+    console.error('GET /api/trash error:', err.message);
+    res.status(500).json({ error: 'Could not load trash.' });
+  }
+});
+
+// ── Restore a member from the trash ──
+app.post('/api/restore-member/:id', requirePermission('can_delete_member'), async (req, res) => {
+  const memberId = req.params.id;
+  try {
+    const result = await pool.query(
+      'UPDATE members SET deleted_at = NULL WHERE member_id = $1 AND deleted_at IS NOT NULL RETURNING *',
+      [memberId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Member not in trash.' });
+    // re-fetch cars so the restored card is complete
+    const cars = await pool.query('SELECT * FROM cars WHERE member_id = $1', [memberId]);
+    const restored = { ...result.rows[0], cars: cars.rows };
+    io.emit('memberAdded', restored); // reappears in everyone's list
+    res.json({ success: true, member: restored });
+  } catch (err) {
+    console.error('POST /api/restore-member error:', err.message);
+    res.status(500).json({ error: 'Could not restore member.' });
+  }
+});
+
+// ── Permanently delete a member (from trash, Admin-gated via permission) ──
+app.delete('/api/purge-member/:id', requirePermission('can_delete_member'), async (req, res) => {
+  const memberId = req.params.id;
+  try {
+    await pool.query('DELETE FROM point_transactions WHERE member_id = $1', [memberId]);
+    await pool.query('DELETE FROM cars WHERE member_id = $1', [memberId]);
+    await pool.query('DELETE FROM members WHERE member_id = $1 AND deleted_at IS NOT NULL', [memberId]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/purge-member error:', err.message);
+    res.status(500).json({ error: 'Could not permanently delete member.' });
   }
 });
 
