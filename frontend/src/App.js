@@ -2,7 +2,14 @@ import React, { useEffect, useState, useCallback } from 'react';
 import io from 'socket.io-client';
 
 const API_BASE = 'https://car-shop-system.onrender.com';
-const socket = io(API_BASE, { transports: ['websocket', 'polling'] });
+// Socket connects only after login, sending the session token in the
+// handshake so the server can authenticate it. autoConnect:false prevents
+// an unauthenticated connection attempt on page load.
+const socket = io(API_BASE, {
+  transports: ['websocket', 'polling'],
+  autoConnect: false,
+  auth: (cb) => cb({ token: localStorage.getItem('carshop_token') || '' }),
+});
 
 // ── Theme tokens ──
 const THEMES = {
@@ -431,7 +438,9 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme }) {
               }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                   <span style={{ color: theme.text }}>{tx.description || 'No description'}</span>
-                  <span style={{ color: theme.textFaint, fontSize: 11 }}>{formatDateTime(tx.transaction_date)}</span>
+                  <span style={{ color: theme.textFaint, fontSize: 11 }}>
+                    {formatDateTime(tx.transaction_date)}{tx.staff_name ? ` · by ${tx.staff_name}` : ''}
+                  </span>
                 </div>
                 <span style={{ color: positive ? '#10b981' : '#ef4444', fontWeight: 700, fontSize: 14, whiteSpace: 'nowrap', marginLeft: 12 }}>
                   {positive ? '+' : ''}{tx.points_added} pts
@@ -447,6 +456,7 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme }) {
 
 // ── Login screen ──
 function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -459,14 +469,16 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
       const res = await fetch(`${API_BASE}/api/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({ username, password }),
       });
       const data = await res.json();
       if (res.ok && data.success) {
         localStorage.setItem('carshop_token', data.token);
-        onSuccess();
+        localStorage.setItem('carshop_role', data.role);
+        localStorage.setItem('carshop_username', data.username);
+        onSuccess({ role: data.role, username: data.username });
       } else {
-        setError(data.error || 'Incorrect password');
+        setError(data.error || 'Incorrect username or password');
       }
     } catch (err) {
       setError('Could not reach server. Try again in a moment.');
@@ -489,7 +501,9 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
         <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 28, color: theme.text, fontWeight: 800, marginBottom: 24, letterSpacing: -0.5 }}>
           Car Shop<br /><span style={{ color: theme.accent }}>Dashboard</span>
         </h1>
-        <input type="password" placeholder="Enter password…" value={password} onChange={e => setPassword(e.target.value)} autoFocus
+        <input type="text" placeholder="Username" value={username} onChange={e => setUsername(e.target.value)} autoFocus autoCapitalize="none"
+          style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 16, marginBottom: 10 })} />
+        <input type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)}
           style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 16, marginBottom: 14 })} />
         {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
         <button type="submit" disabled={loading} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: loading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
@@ -504,6 +518,9 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
 // ════════════════════════════════════════════════
 export default function App() {
   const [authed, setAuthed] = useState(!!localStorage.getItem('carshop_token'));
+  const [userRole, setUserRole] = useState(localStorage.getItem('carshop_role') || '');
+  const [userName, setUserName] = useState(localStorage.getItem('carshop_username') || '');
+  const isAdmin = userRole === 'Admin';
   const [themeName, setThemeName] = useState(getInitialTheme);
   const theme = THEMES[themeName];
 
@@ -542,10 +559,19 @@ export default function App() {
 
   useEffect(() => {
     _onUnauthorized = () => setAuthed(false);
-    if (!authed) { setLoading(false); return; }
+    if (!authed) {
+      setLoading(false);
+      socket.disconnect(); // no listening while logged out
+      return;
+    }
     fetchMembers();
+    socket.connect(); // handshake sends the session token (see auth callback above)
     socket.on('connect', () => setConnected(true));
     socket.on('disconnect', () => setConnected(false));
+    socket.on('connect_error', (err) => {
+      // Server rejected the token (expired session) — treat like a 401
+      if (err?.message === 'unauthorized') setConnected(false);
+    });
     socket.on('pointsUpdated', ({ memberId, newTotal }) => {
       setMembers(prev => prev.map(m => m.member_id == memberId ? { ...m, total_points: newTotal } : m));
     });
@@ -564,9 +590,11 @@ export default function App() {
       });
     });
     return () => {
-      socket.off('connect'); socket.off('disconnect'); socket.off('pointsUpdated');
+      socket.off('connect'); socket.off('disconnect'); socket.off('connect_error');
+      socket.off('pointsUpdated');
       socket.off('memberAdded'); socket.off('memberDeleted');
       socket.off('carAdded'); socket.off('carDeleted'); socket.off('transactionAdded');
+      socket.disconnect();
     };
   }, [fetchMembers, authed]);
 
@@ -665,7 +693,12 @@ export default function App() {
     .sort((a, b) => a.full_name.localeCompare(b.full_name));
 
   if (!authed) {
-    return <LoginScreen onSuccess={() => setAuthed(true)} theme={theme} themeName={themeName} onToggleTheme={toggleTheme} />;
+    return (
+      <LoginScreen
+        onSuccess={({ role, username }) => { setUserRole(role); setUserName(username); setAuthed(true); }}
+        theme={theme} themeName={themeName} onToggleTheme={toggleTheme}
+      />
+    );
   }
 
   return (
@@ -706,9 +739,12 @@ export default function App() {
             <ThemeToggle theme={theme} themeName={themeName} onToggle={toggleTheme} />
             <StatusBadge connected={connected} />
             <span style={{ fontSize: 11, color: theme.textFaint }}>{filteredMembers.length} member{filteredMembers.length !== 1 ? 's' : ''}</span>
+            <span style={{ fontSize: 11, color: theme.textDim }}>
+              👤 {userName} · <span style={{ color: isAdmin ? '#f59e0b' : theme.accent }}>{userRole}</span>
+            </span>
             <div style={{ display: 'flex', gap: 6 }}>
               <button onClick={() => setShowChangePassword(true)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Settings</button>
-              <button onClick={() => { localStorage.removeItem('carshop_token'); setAuthed(false); }} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Lock</button>
+              <button onClick={() => { localStorage.removeItem('carshop_token'); localStorage.removeItem('carshop_role'); localStorage.removeItem('carshop_username'); setAuthed(false); }} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Lock</button>
             </div>
           </div>
         </div>
@@ -806,7 +842,9 @@ export default function App() {
                       >
                         {openPointsPanel === member.member_id ? 'Close' : '＋ Add Points'}
                       </button>
-                      <button onClick={() => handleDeleteMember(member.member_id, member.full_name)} style={btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455' })}>Delete</button>
+                      {isAdmin && (
+                        <button onClick={() => handleDeleteMember(member.member_id, member.full_name)} style={btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455' })}>Delete</button>
+                      )}
                     </div>
                   </div>
 

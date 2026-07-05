@@ -37,79 +37,82 @@ const pool = new Pool(
       }
 );
 
-// ── Password + session storage ──
-const FALLBACK_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
+// ── Staff accounts + session storage ──
+// Auth is per-staff-member: each user has a username, bcrypt password hash,
+// and a role ('Admin' or 'Technician'). Sessions live in the DB (survive
+// Render cold starts) and carry the staff id + role.
 const SESSION_TTL_HOURS = 12;
 
 async function ensureAuthTables() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
+    CREATE TABLE IF NOT EXISTS staff_users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('Admin', 'Technician')),
+      created_at TIMESTAMP DEFAULT NOW()
     );
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
+      staff_id INT REFERENCES staff_users(id) ON DELETE CASCADE,
+      role TEXT,
       expires_at TIMESTAMP NOT NULL
     );
   `);
-  const existing = await pool.query("SELECT value FROM settings WHERE key = 'admin_password_hash'");
-  if (existing.rows.length === 0) {
-    const hash = await bcrypt.hash(FALLBACK_PASSWORD, 10);
+  // Seed default admins on first run (temp password from env or 'changeme-now').
+  const count = await pool.query('SELECT COUNT(*) FROM staff_users');
+  if (parseInt(count.rows[0].count) === 0) {
+    const tempHash = await bcrypt.hash(process.env.ADMIN_PASSWORD || 'changeme-now', 12);
     await pool.query(
-      "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1)",
-      [hash]
+      `INSERT INTO staff_users (username, password_hash, role) VALUES
+       ('aloysius', $1, 'Admin'),
+       ('kishen', $1, 'Admin')`,
+      [tempHash]
     );
-    console.log('🔑 Seeded initial admin password from ADMIN_PASSWORD env var.');
+    console.log('🔑 Seeded default admin accounts: aloysius, kishen (change passwords immediately).');
   }
 }
 ensureAuthTables().catch(err => console.error('Auth tables setup failed:', err.message));
 
-// Cache the hash in memory so the auth middleware doesn't hit the DB
-// on every single request. Invalidated whenever the password changes.
-let _cachedHash = null;
-
-async function getPasswordHash() {
-  if (_cachedHash) return _cachedHash;
-  const result = await pool.query("SELECT value FROM settings WHERE key = 'admin_password_hash'");
-  _cachedHash = result.rows[0]?.value || null;
-  return _cachedHash;
-}
-
-async function setPasswordHash(newHash) {
-  await pool.query(
-    "INSERT INTO settings (key, value) VALUES ('admin_password_hash', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
-    [newHash]
-  );
-  _cachedHash = newHash;
-  // Changing the password invalidates every existing session.
-  await pool.query('DELETE FROM sessions');
-}
-
 // ── Session helpers ──
-async function createSession() {
-  const token = crypto.randomUUID() + crypto.randomUUID(); // 72 chars of randomness
+async function createSession(staffId, role) {
+  const token = crypto.randomUUID() + crypto.randomUUID();
   await pool.query(
-    "INSERT INTO sessions (token, expires_at) VALUES ($1, NOW() + ($2 || ' hours')::interval)",
-    [token, String(SESSION_TTL_HOURS)]
+    "INSERT INTO sessions (token, staff_id, role, expires_at) VALUES ($1, $2, $3, NOW() + ($4 || ' hours')::interval)",
+    [token, staffId, role, String(SESSION_TTL_HOURS)]
   );
   return token;
 }
 
-async function isValidSession(token) {
-  if (!token) return false;
+// Returns { id, role, username } if the session is valid, else null.
+async function getSessionUser(token) {
+  if (!token) return null;
   const result = await pool.query(
-    'SELECT 1 FROM sessions WHERE token = $1 AND expires_at > NOW()',
+    `SELECT s.staff_id AS id, s.role, u.username
+       FROM sessions s JOIN staff_users u ON u.id = s.staff_id
+      WHERE s.token = $1 AND s.expires_at > NOW()`,
     [token]
   );
-  return result.rows.length > 0;
+  return result.rows[0] || null;
 }
 
 // Clean out expired sessions occasionally (every hour)
 setInterval(() => {
   pool.query('DELETE FROM sessions WHERE expires_at <= NOW()').catch(() => {});
 }, 60 * 60 * 1000);
+
+// ── Socket.IO authentication ──
+io.use(async (socket, next) => {
+  try {
+    const user = await getSessionUser(socket.handshake.auth?.token);
+    if (user) { socket.user = user; return next(); }
+    next(new Error('unauthorized'));
+  } catch (err) {
+    next(new Error('unauthorized'));
+  }
+});
 
 // ── Rate limiter for /api/login ──
 const loginAttempts = new Map();
@@ -133,16 +136,25 @@ function loginRateLimiter(req, res, next) {
 }
 
 app.post('/api/login', loginRateLimiter, async (req, res) => {
-  const { password } = req.body;
+  const { username, password } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required.' });
+  }
   try {
-    const hash = await getPasswordHash();
-    if (!hash) return res.status(500).json({ error: 'Password not set up yet. Try again shortly.' });
-    const match = await bcrypt.compare(password || '', hash);
-    if (match) {
-      const token = await createSession();
-      res.json({ success: true, token, expiresInHours: SESSION_TTL_HOURS });
+    const result = await pool.query(
+      'SELECT id, username, password_hash, role FROM staff_users WHERE LOWER(username) = LOWER($1)',
+      [username.trim()]
+    );
+    const user = result.rows[0];
+    // Compare against a dummy hash when user not found so response timing
+    // doesn't reveal which usernames exist.
+    const hash = user?.password_hash || '$2a$12$invalidinvalidinvalidinvaliduuuuuuuuuuuuuuuuuuuuuuuuu';
+    const match = await bcrypt.compare(password, hash);
+    if (user && match) {
+      const token = await createSession(user.id, user.role);
+      res.json({ success: true, token, role: user.role, username: user.username, expiresInHours: SESSION_TTL_HOURS });
     } else {
-      res.status(401).json({ error: 'Incorrect password' });
+      res.status(401).json({ error: 'Incorrect username or password' });
     }
   } catch (err) {
     console.error('POST /api/login error:', err.message);
@@ -153,15 +165,24 @@ app.post('/api/login', loginRateLimiter, async (req, res) => {
 app.use('/api', async (req, res, next) => {
   if (req.path === '/login') return next();
   try {
-    const token = req.headers['x-admin-token'];
-    if (!(await isValidSession(token))) {
+    const user = await getSessionUser(req.headers['x-admin-token']);
+    if (!user) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
+    req.user = user; // { id, role, username } available to every route
     next();
   } catch (err) {
     res.status(500).json({ error: 'Auth check failed' });
   }
 });
+
+// ── RBAC: only Admins may pass ──
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'Admin') {
+    return res.status(403).json({ error: 'Admin access required.' });
+  }
+  next();
+}
 
 // ── Health check ──
 app.get('/', (req, res) => {
@@ -175,12 +196,15 @@ app.post('/api/change-password', async (req, res) => {
     return res.status(400).json({ error: 'New password must be at least 10 characters.' });
   }
   try {
-    const hash = await getPasswordHash();
-    const match = await bcrypt.compare(currentPassword || '', hash);
+    const result = await pool.query('SELECT password_hash FROM staff_users WHERE id = $1', [req.user.id]);
+    const match = await bcrypt.compare(currentPassword || '', result.rows[0]?.password_hash || '');
     if (!match) return res.status(401).json({ error: 'Current password is incorrect.' });
+
     const newHash = await bcrypt.hash(newPassword, 12);
-    await setPasswordHash(newHash); // also wipes all existing sessions
-    const token = await createSession(); // fresh session for this user
+    await pool.query('UPDATE staff_users SET password_hash = $1 WHERE id = $2', [newHash, req.user.id]);
+    // Invalidate this user's other sessions, keep them logged in with a fresh one.
+    await pool.query('DELETE FROM sessions WHERE staff_id = $1', [req.user.id]);
+    const token = await createSession(req.user.id, req.user.role);
     res.json({ success: true, token });
   } catch (err) {
     console.error('POST /api/change-password error:', err.message);
@@ -354,8 +378,8 @@ app.post('/api/add-points', async (req, res) => {
     }
 
     const txResult = await client.query(
-      'INSERT INTO point_transactions (member_id, points_added, description) VALUES ($1, $2, $3) RETURNING transaction_id, points_added, description, transaction_date',
-      [memberId, numericPoints, description]
+      'INSERT INTO point_transactions (member_id, points_added, description, staff_id) VALUES ($1, $2, $3, $4) RETURNING transaction_id, points_added, description, transaction_date, staff_id',
+      [memberId, numericPoints, description, req.user.id]
     );
 
     await client.query('COMMIT');
@@ -378,7 +402,11 @@ app.get('/api/transactions/:memberId', async (req, res) => {
   const { memberId } = req.params;
   try {
     const result = await pool.query(
-      'SELECT transaction_id, points_added, description, transaction_date FROM point_transactions WHERE member_id = $1 ORDER BY transaction_date DESC LIMIT 50',
+      `SELECT t.transaction_id, t.points_added, t.description, t.transaction_date, u.username AS staff_name
+         FROM point_transactions t
+         LEFT JOIN staff_users u ON u.id = t.staff_id
+        WHERE t.member_id = $1
+        ORDER BY t.transaction_date DESC LIMIT 50`,
       [memberId]
     );
     res.json(result.rows);
@@ -389,7 +417,7 @@ app.get('/api/transactions/:memberId', async (req, res) => {
 });
 
 // ── Delete a member ──
-app.delete('/api/delete-member/:id', async (req, res) => {
+app.delete('/api/delete-member/:id', requireAdmin, async (req, res) => {
   const memberId = req.params.id;
   try {
     await pool.query('DELETE FROM point_transactions WHERE member_id = $1', [memberId]);
