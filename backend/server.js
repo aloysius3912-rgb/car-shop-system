@@ -50,6 +50,10 @@ async function ensureAuthTables() {
       username TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL CHECK (role IN ('Admin', 'Technician')),
+      can_add_member BOOLEAN DEFAULT true,
+      can_delete_member BOOLEAN DEFAULT false,
+      can_add_points BOOLEAN DEFAULT true,
+      can_deduct_points BOOLEAN DEFAULT true,
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
@@ -90,12 +94,30 @@ async function createSession(staffId, role) {
 async function getSessionUser(token) {
   if (!token) return null;
   const result = await pool.query(
-    `SELECT s.staff_id AS id, s.role, u.username
+    `SELECT s.staff_id AS id, s.role, u.username,
+            u.can_add_member, u.can_delete_member, u.can_add_points, u.can_deduct_points
        FROM sessions s JOIN staff_users u ON u.id = s.staff_id
       WHERE s.token = $1 AND s.expires_at > NOW()`,
     [token]
   );
   return result.rows[0] || null;
+}
+
+// Admins implicitly have every permission; Technicians use their flags.
+function can(user, permission) {
+  if (!user) return false;
+  if (user.role === 'Admin') return true;
+  return user[permission] === true;
+}
+
+// Middleware factory: enforce a permission on a route.
+function requirePermission(permission) {
+  return (req, res, next) => {
+    if (!can(req.user, permission)) {
+      return res.status(403).json({ error: 'You do not have permission to do that.' });
+    }
+    next();
+  };
 }
 
 // Clean out expired sessions occasionally (every hour)
@@ -212,6 +234,118 @@ app.post('/api/change-password', async (req, res) => {
   }
 });
 
+// ── Who am I (returns my role + permissions so the UI can adapt) ──
+app.get('/api/me', (req, res) => {
+  const u = req.user;
+  res.json({
+    id: u.id, username: u.username, role: u.role,
+    permissions: {
+      can_add_member: can(u, 'can_add_member'),
+      can_delete_member: can(u, 'can_delete_member'),
+      can_add_points: can(u, 'can_add_points'),
+      can_deduct_points: can(u, 'can_deduct_points'),
+    },
+  });
+});
+
+// ── Staff management (Admin only) ──
+app.get('/api/staff', requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, username, role, can_add_member, can_delete_member,
+              can_add_points, can_deduct_points, created_at
+         FROM staff_users ORDER BY created_at ASC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('GET /api/staff error:', err.message);
+    res.status(500).json({ error: 'Could not load staff.' });
+  }
+});
+
+app.post('/api/staff', requireAdmin, async (req, res) => {
+  const { username, password, role, permissions } = req.body;
+  if (!username || !username.trim()) return res.status(400).json({ error: 'Username is required.' });
+  if (!password || password.length < 10) return res.status(400).json({ error: 'Password must be at least 10 characters.' });
+  if (!['Admin', 'Technician'].includes(role)) return res.status(400).json({ error: 'Invalid role.' });
+  try {
+    const hash = await bcrypt.hash(password, 12);
+    const p = permissions || {};
+    const result = await pool.query(
+      `INSERT INTO staff_users (username, password_hash, role, can_add_member, can_delete_member, can_add_points, can_deduct_points)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, username, role, can_add_member, can_delete_member, can_add_points, can_deduct_points, created_at`,
+      [username.trim(), hash, role, !!p.can_add_member, !!p.can_delete_member, !!p.can_add_points, !!p.can_deduct_points]
+    );
+    res.json({ success: true, staff: result.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'That username is already taken.' });
+    console.error('POST /api/staff error:', err.message);
+    res.status(500).json({ error: 'Could not create staff account.' });
+  }
+});
+
+app.put('/api/staff/:id', requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { role, permissions } = req.body;
+  const p = permissions || {};
+  try {
+    if (role && !['Admin', 'Technician'].includes(role)) {
+      return res.status(400).json({ error: 'Invalid role.' });
+    }
+    await pool.query(
+      `UPDATE staff_users
+          SET role = COALESCE($2, role),
+              can_add_member = $3, can_delete_member = $4,
+              can_add_points = $5, can_deduct_points = $6
+        WHERE id = $1`,
+      [id, role || null, !!p.can_add_member, !!p.can_delete_member, !!p.can_add_points, !!p.can_deduct_points]
+    );
+    // Changing permissions takes effect on their next request via getSessionUser.
+    res.json({ success: true });
+  } catch (err) {
+    console.error('PUT /api/staff error:', err.message);
+    res.status(500).json({ error: 'Could not update staff account.' });
+  }
+});
+
+app.post('/api/staff/:id/reset-password', requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { newPassword } = req.body;
+  if (!newPassword || newPassword.length < 10) {
+    return res.status(400).json({ error: 'Password must be at least 10 characters.' });
+  }
+  try {
+    const hash = await bcrypt.hash(newPassword, 12);
+    await pool.query('UPDATE staff_users SET password_hash = $1 WHERE id = $2', [hash, id]);
+    await pool.query('DELETE FROM sessions WHERE staff_id = $1', [id]); // force re-login
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/staff reset-password error:', err.message);
+    res.status(500).json({ error: 'Could not reset password.' });
+  }
+});
+
+app.delete('/api/staff/:id', requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  if (parseInt(id) === req.user.id) {
+    return res.status(400).json({ error: 'You cannot delete your own account.' });
+  }
+  try {
+    // Don't allow deleting the last Admin
+    const admins = await pool.query("SELECT COUNT(*) FROM staff_users WHERE role = 'Admin'");
+    const target = await pool.query('SELECT role FROM staff_users WHERE id = $1', [id]);
+    if (target.rows[0]?.role === 'Admin' && parseInt(admins.rows[0].count) <= 1) {
+      return res.status(400).json({ error: 'Cannot delete the last Admin account.' });
+    }
+    await pool.query('DELETE FROM staff_users WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('DELETE /api/staff error:', err.message);
+    res.status(500).json({ error: 'Could not delete staff account.' });
+  }
+});
+
 // ── Fetch ALL members with their cars ──
 app.get('/api/members', async (req, res) => {
   try {
@@ -238,7 +372,7 @@ app.get('/api/members', async (req, res) => {
 });
 
 // ── Register a new member with their first car ──
-app.post('/api/new-member', async (req, res) => {
+app.post('/api/new-member', requirePermission('can_add_member'), async (req, res) => {
   const { fullName, carPlate, carModel } = req.body;
   if (!fullName || !fullName.trim()) {
     return res.status(400).json({ error: 'Full name is required' });
@@ -343,6 +477,12 @@ app.post('/api/add-points', async (req, res) => {
   const { memberId, points, description } = req.body;
   const numericPoints = parseInt(points, 10) || 0;
 
+  // Enforce add vs deduct permission based on the sign of the points.
+  const perm = numericPoints < 0 ? 'can_deduct_points' : 'can_add_points';
+  if (!can(req.user, perm)) {
+    return res.status(403).json({ error: `You do not have permission to ${numericPoints < 0 ? 'deduct' : 'add'} points.` });
+  }
+
   // Everything runs on ONE client inside a transaction so the balance
   // update and the history log either both happen or neither does.
   const client = await pool.connect();
@@ -417,7 +557,7 @@ app.get('/api/transactions/:memberId', async (req, res) => {
 });
 
 // ── Delete a member ──
-app.delete('/api/delete-member/:id', requireAdmin, async (req, res) => {
+app.delete('/api/delete-member/:id', requirePermission('can_delete_member'), async (req, res) => {
   const memberId = req.params.id;
   try {
     await pool.query('DELETE FROM point_transactions WHERE member_id = $1', [memberId]);

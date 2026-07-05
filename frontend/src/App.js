@@ -223,8 +223,8 @@ function ChangePasswordModal({ onClose, theme }) {
 }
 
 // ── Points panel with earn/redeem tabs ──
-function PointsPanel({ memberId, theme, pointsValue, descriptionValue, onPointsChange, onDescriptionChange, onApply }) {
-  const [tab, setTab] = useState('earn');
+function PointsPanel({ memberId, theme, pointsValue, descriptionValue, onPointsChange, onDescriptionChange, onApply, canAdd = true, canDeduct = true }) {
+  const [tab, setTab] = useState(canAdd ? 'earn' : 'redeem');
   const [selectedPreset, setSelectedPreset] = useState(null);
   const isRedeem = tab === 'redeem';
   const presets = isRedeem ? REDEEM_PRESETS : SERVICE_PRESETS;
@@ -242,7 +242,7 @@ function PointsPanel({ memberId, theme, pointsValue, descriptionValue, onPointsC
   return (
     <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${theme.border}`, animation: 'fadeIn 0.2s ease both' }}>
       <div style={{ display: 'flex', gap: 0, marginBottom: 14, background: theme.inputBg, borderRadius: 8, padding: 3, border: `1px solid ${theme.border}`, width: 'fit-content' }}>
-        {[['earn', '＋ Earn Points'], ['redeem', '− Redeem Points']].map(([key, label]) => (
+        {[['earn', '＋ Earn Points'], ['redeem', '− Redeem Points']].filter(([key]) => key === 'earn' ? canAdd : canDeduct).map(([key, label]) => (
           <button key={key} onClick={() => switchTab(key)} style={{
             padding: '7px 16px', borderRadius: 6, fontSize: 12, fontWeight: 700,
             fontFamily: "'JetBrains Mono', monospace", cursor: 'pointer', border: 'none',
@@ -516,11 +516,199 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
 }
 
 // ════════════════════════════════════════════════
+// ── Staff Management panel (Admin only) ──
+const PERMISSION_LABELS = [
+  ['can_add_member', 'Add customers'],
+  ['can_delete_member', 'Delete customers'],
+  ['can_add_points', 'Add points'],
+  ['can_deduct_points', 'Redeem points'],
+];
+
+function StaffPanel({ theme, currentUserId, onClose }) {
+  const [staff, setStaff] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showCreate, setShowCreate] = useState(false);
+
+  // create form
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [role, setRole] = useState('Technician');
+  const [perms, setPerms] = useState({ can_add_member: true, can_delete_member: false, can_add_points: true, can_deduct_points: true });
+  const [creating, setCreating] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const data = await apiFetch('/api/staff');
+      setStaff(Array.isArray(data) ? data : []);
+    } catch (err) {
+      toast(`Could not load staff: ${err.message}`, 'error');
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { load(); }, []);
+
+  const handleCreate = async (e) => {
+    e.preventDefault();
+    setCreating(true);
+    try {
+      await apiFetch('/api/staff', {
+        method: 'POST',
+        body: JSON.stringify({ username: username.trim(), password, role, permissions: role === 'Admin' ? {} : perms }),
+      });
+      toast(`✅ ${username.trim()} created!`);
+      setUsername(''); setPassword(''); setRole('Technician');
+      setPerms({ can_add_member: true, can_delete_member: false, can_add_points: true, can_deduct_points: true });
+      setShowCreate(false);
+      load();
+    } catch (err) {
+      toast(`Create failed: ${err.message}`, 'error');
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const togglePerm = async (member, key) => {
+    const updated = { ...member, [key]: !member[key] };
+    setStaff(prev => prev.map(s => s.id === member.id ? updated : s)); // optimistic
+    try {
+      await apiFetch(`/api/staff/${member.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          role: member.role,
+          permissions: {
+            can_add_member: updated.can_add_member,
+            can_delete_member: updated.can_delete_member,
+            can_add_points: updated.can_add_points,
+            can_deduct_points: updated.can_deduct_points,
+          },
+        }),
+      });
+    } catch (err) {
+      toast(`Update failed: ${err.message}`, 'error');
+      load(); // revert
+    }
+  };
+
+  const resetPassword = async (member) => {
+    const np = window.prompt(`New password for ${member.username} (min 10 chars):`);
+    if (!np) return;
+    try {
+      await apiFetch(`/api/staff/${member.id}/reset-password`, {
+        method: 'POST', body: JSON.stringify({ newPassword: np }),
+      });
+      toast(`✅ Password reset for ${member.username}. They'll need to log in again.`);
+    } catch (err) {
+      toast(`Reset failed: ${err.message}`, 'error');
+    }
+  };
+
+  const deleteStaff = async (member) => {
+    if (!window.confirm(`Delete staff account "${member.username}"? This cannot be undone.`)) return;
+    try {
+      await apiFetch(`/api/staff/${member.id}`, { method: 'DELETE' });
+      toast(`${member.username} removed.`, 'warn');
+      load();
+    } catch (err) {
+      toast(`Delete failed: ${err.message}`, 'error');
+    }
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', zIndex: 8888, padding: 20, overflowY: 'auto' }}>
+      <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '28px 30px', maxWidth: 640, width: '100%', margin: '40px 0', fontFamily: "'JetBrains Mono', monospace" }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <h3 style={{ color: theme.text, fontSize: 20, fontFamily: "'Space Grotesk', sans-serif", margin: 0 }}>Staff Management</h3>
+          <button onClick={onClose} style={btnStyle('#374151', '#fff', { padding: '6px 14px' })}>Close</button>
+        </div>
+
+        {loading ? (
+          <p style={{ color: theme.textFaint, fontSize: 14 }}>Loading staff…</p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 20 }}>
+            {staff.map(member => (
+              <div key={member.id} style={{ background: theme.inputBg, border: `1px solid ${theme.border}`, borderRadius: 10, padding: '14px 16px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: member.role === 'Admin' ? 0 : 10 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <span style={{ fontWeight: 700, color: theme.text }}>{member.username}</span>
+                    <span style={{ background: `${member.role === 'Admin' ? '#f59e0b' : theme.accent}18`, color: member.role === 'Admin' ? '#f59e0b' : theme.accent, border: `1px solid ${member.role === 'Admin' ? '#f59e0b' : theme.accent}44`, padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700 }}>{member.role}</span>
+                    {member.id === currentUserId && <span style={{ fontSize: 10, color: theme.textFaint }}>(you)</span>}
+                  </div>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button onClick={() => resetPassword(member)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textDim, borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>Reset PW</button>
+                    {member.id !== currentUserId && (
+                      <button onClick={() => deleteStaff(member)} style={{ background: 'none', border: '1px solid #ef444455', color: '#ef4444', borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>Delete</button>
+                    )}
+                  </div>
+                </div>
+                {member.role === 'Admin' ? null : (
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    {PERMISSION_LABELS.map(([key, label]) => (
+                      <button key={key} onClick={() => togglePerm(member, key)} style={{
+                        padding: '5px 10px', borderRadius: 6, fontSize: 11, cursor: 'pointer',
+                        fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
+                        border: `1px solid ${member[key] ? theme.accent : theme.border}`,
+                        background: member[key] ? `${theme.accent}18` : 'transparent',
+                        color: member[key] ? theme.accent : theme.textFaint,
+                      }}>
+                        {member[key] ? '✓' : '✕'} {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {showCreate ? (
+          <form onSubmit={handleCreate} style={{ borderTop: `1px solid ${theme.border}`, paddingTop: 18 }}>
+            <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 2, marginBottom: 12, textTransform: 'uppercase' }}>New Staff Account</div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+              <input type="text" placeholder="Username" value={username} onChange={e => setUsername(e.target.value)} required autoCapitalize="none" style={inputStyle(theme, { flex: '1 1 140px' })} />
+              <input type="text" placeholder="Password (min 10 chars)" value={password} onChange={e => setPassword(e.target.value)} required style={inputStyle(theme, { flex: '1 1 180px' })} />
+              <select value={role} onChange={e => setRole(e.target.value)} style={inputStyle(theme, { flex: '0 0 auto', cursor: 'pointer' })}>
+                <option value="Technician">Technician</option>
+                <option value="Admin">Admin</option>
+              </select>
+            </div>
+            {role === 'Technician' && (
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
+                {PERMISSION_LABELS.map(([key, label]) => (
+                  <button type="button" key={key} onClick={() => setPerms(p => ({ ...p, [key]: !p[key] }))} style={{
+                    padding: '6px 12px', borderRadius: 6, fontSize: 12, cursor: 'pointer',
+                    fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
+                    border: `1px solid ${perms[key] ? theme.accent : theme.border}`,
+                    background: perms[key] ? `${theme.accent}18` : 'transparent',
+                    color: perms[key] ? theme.accent : theme.textFaint,
+                  }}>{perms[key] ? '✓' : '✕'} {label}</button>
+                ))}
+              </div>
+            )}
+            {role === 'Admin' && <p style={{ fontSize: 11, color: theme.textFaint, marginBottom: 14 }}>Admins have all permissions automatically.</p>}
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button type="submit" disabled={creating} style={{ ...btnStyle(theme.accent, theme.bg), opacity: creating ? 0.6 : 1 }}>{creating ? 'Creating…' : 'Create Account'}</button>
+              <button type="button" onClick={() => setShowCreate(false)} style={btnStyle('#374151', '#fff')}>Cancel</button>
+            </div>
+          </form>
+        ) : (
+          <button onClick={() => setShowCreate(true)} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%' }}>＋ Add New Staff</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [authed, setAuthed] = useState(!!localStorage.getItem('carshop_token'));
   const [userRole, setUserRole] = useState(localStorage.getItem('carshop_role') || '');
   const [userName, setUserName] = useState(localStorage.getItem('carshop_username') || '');
+  const [permissions, setPermissions] = useState(null); // fetched from /api/me
+  const [userId, setUserId] = useState(null);
   const isAdmin = userRole === 'Admin';
+  const can = (perm) => isAdmin || (permissions ? !!permissions[perm] : false);
+  const [showStaffPanel, setShowStaffPanel] = useState(false);
   const [themeName, setThemeName] = useState(getInitialTheme);
   const theme = THEMES[themeName];
 
@@ -565,6 +753,9 @@ export default function App() {
       return;
     }
     fetchMembers();
+    apiFetch('/api/me')
+      .then(me => { setPermissions(me.permissions); setUserRole(me.role); setUserName(me.username); setUserId(me.id); })
+      .catch(() => {});
     socket.connect(); // handshake sends the session token (see auth callback above)
     socket.on('connect', () => setConnected(true));
     socket.on('disconnect', () => setConnected(false));
@@ -724,6 +915,7 @@ export default function App() {
         />
       )}
       {showChangePassword && <ChangePasswordModal onClose={() => setShowChangePassword(false)} theme={theme} />}
+      {showStaffPanel && isAdmin && <StaffPanel theme={theme} currentUserId={userId} onClose={() => setShowStaffPanel(false)} />}
 
       <div style={{ maxWidth: 900, margin: '0 auto', padding: '40px 20px', fontFamily: "'JetBrains Mono', monospace" }}>
 
@@ -743,6 +935,9 @@ export default function App() {
               👤 {userName} · <span style={{ color: isAdmin ? '#f59e0b' : theme.accent }}>{userRole}</span>
             </span>
             <div style={{ display: 'flex', gap: 6 }}>
+              {isAdmin && (
+                <button onClick={() => setShowStaffPanel(true)} style={{ background: 'none', border: `1px solid ${theme.accent}`, color: theme.accent, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Staff</button>
+              )}
               <button onClick={() => setShowChangePassword(true)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Settings</button>
               <button onClick={() => { localStorage.removeItem('carshop_token'); localStorage.removeItem('carshop_role'); localStorage.removeItem('carshop_username'); setAuthed(false); }} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Lock</button>
             </div>
@@ -755,7 +950,8 @@ export default function App() {
           </div>
         )}
 
-        {/* REGISTER FORM */}
+        {/* REGISTER FORM (only if allowed to add members) */}
+        {can('can_add_member') && (
         <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: 28, marginBottom: 28 }}>
           <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 3, marginBottom: 14, textTransform: 'uppercase' }}>Register New Customer</div>
           <form onSubmit={handleAddMember} style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
@@ -768,6 +964,7 @@ export default function App() {
             </button>
           </form>
         </div>
+        )}
 
         {/* SEARCH */}
         <div style={{ marginBottom: 28, position: 'relative' }}>
@@ -836,13 +1033,15 @@ export default function App() {
 
                     {/* CONTROLS */}
                     <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                      <button
-                        onClick={() => setOpenPointsPanel(prev => prev === member.member_id ? null : member.member_id)}
-                        style={btnStyle('#3b82f6', '#fff')}
-                      >
-                        {openPointsPanel === member.member_id ? 'Close' : '＋ Add Points'}
-                      </button>
-                      {isAdmin && (
+                      {(can('can_add_points') || can('can_deduct_points')) && (
+                        <button
+                          onClick={() => setOpenPointsPanel(prev => prev === member.member_id ? null : member.member_id)}
+                          style={btnStyle('#3b82f6', '#fff')}
+                        >
+                          {openPointsPanel === member.member_id ? 'Close' : '＋ Add Points'}
+                        </button>
+                      )}
+                      {can('can_delete_member') && (
                         <button onClick={() => handleDeleteMember(member.member_id, member.full_name)} style={btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455' })}>Delete</button>
                       )}
                     </div>
@@ -853,6 +1052,8 @@ export default function App() {
                     <PointsPanel
                       memberId={member.member_id}
                       theme={theme}
+                      canAdd={can('can_add_points')}
+                      canDeduct={can('can_deduct_points')}
                       pointsValue={adjustments[member.member_id] || ''}
                       descriptionValue={descriptions[member.member_id] || ''}
                       onPointsChange={v => setAdjustments(prev => ({ ...prev, [member.member_id]: v }))}
