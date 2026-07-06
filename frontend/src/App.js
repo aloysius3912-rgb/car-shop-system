@@ -222,6 +222,160 @@ function ChangePasswordModal({ onClose, theme }) {
   );
 }
 
+// ── Telegram 2FA modal (link / unlink, per staff member) ──
+function TelegramModal({ onClose, theme }) {
+  const [status, setStatus] = useState(null); // { botConfigured, linked, pendingCode }
+  const [loading, setLoading] = useState(true);
+  const [code, setCode] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [unlinkPassword, setUnlinkPassword] = useState('');
+  const [showUnlink, setShowUnlink] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const data = await apiFetch('/api/telegram/status');
+      setStatus(data);
+      if (data.pendingCode) setCode(data.pendingCode);
+    } catch (err) {
+      setError(err.message || 'Could not load Telegram status.');
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { load(); }, []);
+
+  const generateCode = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const data = await apiFetch('/api/telegram/link-code', { method: 'POST' });
+      setCode(data.code);
+    } catch (err) {
+      setError(err.message || 'Could not create link code.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirmLink = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      await apiFetch('/api/telegram/confirm-link', { method: 'POST' });
+      toast('✅ Telegram linked! You\'ll get a PIN on every login.');
+      setCode(null);
+      load();
+    } catch (err) {
+      setError(err.message || 'Could not confirm the link.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const unlink = async () => {
+    if (!unlinkPassword) { setError('Enter your password to unlink.'); return; }
+    setBusy(true);
+    setError('');
+    try {
+      await apiFetch('/api/telegram/unlink', {
+        method: 'POST',
+        body: JSON.stringify({ password: unlinkPassword }),
+      });
+      toast('Telegram 2FA disabled for your account.', 'warn');
+      setShowUnlink(false);
+      setUnlinkPassword('');
+      load();
+    } catch (err) {
+      setError(err.message || 'Could not unlink Telegram.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const sectionLabel = (text) => (
+    <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 2, marginBottom: 10, textTransform: 'uppercase' }}>{text}</div>
+  );
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 8888, padding: 20 }}>
+      <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '32px 36px', maxWidth: 420, width: '100%', fontFamily: "'JetBrains Mono', monospace" }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
+          <h3 style={{ color: theme.text, margin: 0, fontSize: 18, fontFamily: "'Space Grotesk', sans-serif" }}>📲 Telegram 2FA</h3>
+          <button onClick={onClose} style={btnStyle('#374151', '#fff', { padding: '6px 14px' })}>Close</button>
+        </div>
+
+        {loading ? (
+          <p style={{ color: theme.textFaint, fontSize: 14 }}>Loading…</p>
+        ) : !status?.botConfigured ? (
+          <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.6 }}>
+            The Telegram bot isn't configured on the server yet. An Admin needs to set the <span style={{ color: theme.accent }}>TELEGRAM_BOT_TOKEN</span> environment variable on Render.
+          </p>
+        ) : status.linked ? (
+          <>
+            {sectionLabel('Status')}
+            <p style={{ color: '#10b981', fontSize: 14, fontWeight: 700, marginBottom: 6 }}>✓ Linked</p>
+            <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.6, marginBottom: 20 }}>
+              Every login now requires a 4-digit PIN sent to your Telegram.
+            </p>
+            {showUnlink ? (
+              <>
+                {sectionLabel('Confirm with your password')}
+                <input type="password" placeholder="Your password" value={unlinkPassword}
+                  onChange={e => setUnlinkPassword(e.target.value)} autoFocus
+                  style={inputStyle(theme, { width: '100%', marginBottom: 12 })} />
+                {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 12 }}>{error}</div>}
+                <div style={{ display: 'flex', gap: 10 }}>
+                  <button onClick={unlink} disabled={busy} style={{ ...btnStyle('#ef4444', '#fff'), opacity: busy ? 0.6 : 1 }}>
+                    {busy ? 'Unlinking…' : 'Disable 2FA'}
+                  </button>
+                  <button onClick={() => { setShowUnlink(false); setUnlinkPassword(''); setError(''); }} style={btnStyle('#374151', '#fff')}>Cancel</button>
+                </div>
+              </>
+            ) : (
+              <button onClick={() => setShowUnlink(true)} style={btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455' })}>
+                Unlink Telegram
+              </button>
+            )}
+          </>
+        ) : code ? (
+          <>
+            {sectionLabel('Step 2 — Send this code to the bot')}
+            <div style={{ background: theme.inputBg, border: `1px solid ${theme.accent}55`, borderRadius: 10, padding: '16px 20px', textAlign: 'center', marginBottom: 14 }}>
+              <span style={{ fontSize: 26, fontWeight: 700, letterSpacing: 4, color: theme.accent }}>{code}</span>
+            </div>
+            <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.7, marginBottom: 16 }}>
+              1. Open Telegram and find the shop's login bot.<br />
+              2. Press <span style={{ color: theme.text }}>Start</span>, then send the code above as a message.<br />
+              3. Come back here and press <span style={{ color: theme.text }}>Confirm Link</span>.
+            </p>
+            {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 12 }}>{error}</div>}
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button onClick={confirmLink} disabled={busy} style={{ ...btnStyle(theme.accent, theme.bg), opacity: busy ? 0.6 : 1 }}>
+                {busy ? 'Checking…' : 'Confirm Link'}
+              </button>
+              <button onClick={generateCode} disabled={busy} style={btnStyle('#374151', '#fff')}>New Code</button>
+            </div>
+          </>
+        ) : (
+          <>
+            {sectionLabel('Status')}
+            <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.6, marginBottom: 20 }}>
+              Not linked. Once linked, logging in will require a 4-digit PIN sent to your Telegram — protecting the account even if the password leaks.
+            </p>
+            {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 12 }}>{error}</div>}
+            <button onClick={generateCode} disabled={busy} style={{ ...btnStyle(theme.accent, theme.bg), opacity: busy ? 0.6 : 1 }}>
+              {busy ? 'Generating…' : 'Enable Telegram 2FA'}
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Points panel with earn/redeem tabs ──
 function PointsPanel({ memberId, theme, cars = [], pointsValue, descriptionValue, onPointsChange, onDescriptionChange, onApply, canAdd = true, canDeduct = true }) {
   const [tab, setTab] = useState(canAdd ? 'earn' : 'redeem');
@@ -493,12 +647,24 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme }) {
   );
 }
 
-// ── Login screen ──
+// ── Login screen (username/password, then optional Telegram PIN step) ──
 function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  // 2FA: when the server answers requires2fa, we hold the challenge token
+  // and switch to the PIN screen.
+  const [challengeToken, setChallengeToken] = useState(null);
+  const [pin, setPin] = useState('');
+  const [verifying, setVerifying] = useState(false);
+
+  const finishLogin = (data) => {
+    localStorage.setItem('carshop_token', data.token);
+    localStorage.setItem('carshop_role', data.role);
+    localStorage.setItem('carshop_username', data.username);
+    onSuccess({ role: data.role, username: data.username });
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -511,11 +677,12 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
         body: JSON.stringify({ username, password }),
       });
       const data = await res.json();
-      if (res.ok && data.success) {
-        localStorage.setItem('carshop_token', data.token);
-        localStorage.setItem('carshop_role', data.role);
-        localStorage.setItem('carshop_username', data.username);
-        onSuccess({ role: data.role, username: data.username });
+      if (res.ok && data.requires2fa) {
+        // Password OK — now wait for the Telegram PIN.
+        setChallengeToken(data.challengeToken);
+        setPin('');
+      } else if (res.ok && data.success) {
+        finishLogin(data);
       } else {
         setError(data.error || 'Incorrect username or password');
       }
@@ -525,6 +692,94 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
       setLoading(false);
     }
   };
+
+  const verifyPin = async (pinValue) => {
+    if (verifying) return;
+    setError('');
+    setVerifying(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/login/verify-2fa`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ challengeToken, pin: pinValue }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        finishLogin(data);
+      } else {
+        setError(data.error || 'Wrong PIN.');
+        setPin('');
+        // Expired or locked-out challenge → back to username/password.
+        if (data.restart) setChallengeToken(null);
+      }
+    } catch (err) {
+      setError('Could not reach server. Try again in a moment.');
+      setPin('');
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  const handlePinChange = (raw) => {
+    const digits = raw.replace(/\D/g, '').slice(0, 4);
+    setPin(digits);
+    if (digits.length === 4) verifyPin(digits); // auto-submit on 4th digit
+  };
+
+  const backToLogin = () => {
+    setChallengeToken(null);
+    setPin('');
+    setError('');
+  };
+
+  // ── PIN step ──
+  if (challengeToken) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'JetBrains Mono', monospace", background: theme.bg, padding: 20, transition: 'background 0.2s ease' }}>
+        <style>{`
+          @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@600;700;800&display=swap');
+          @keyframes spin { to { transform: rotate(360deg); } }
+        `}</style>
+        <div style={{ position: 'fixed', top: 20, right: 20 }}>
+          <ThemeToggle theme={theme} themeName={themeName} onToggle={onToggleTheme} />
+        </div>
+        <form onSubmit={e => { e.preventDefault(); if (pin.length === 4) verifyPin(pin); }} style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '40px 36px', maxWidth: 360, width: '100%', textAlign: 'center' }}>
+          <div style={{ fontSize: 36, marginBottom: 10 }}>📲</div>
+          <div style={{ fontSize: 11, letterSpacing: 4, color: theme.accent, marginBottom: 6, textTransform: 'uppercase' }}>Two-Factor Login</div>
+          <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 24, color: theme.text, fontWeight: 800, marginBottom: 10, letterSpacing: -0.5 }}>
+            Enter Telegram PIN
+          </h1>
+          <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.5, marginBottom: 20 }}>
+            A 4-digit PIN was sent to your Telegram. It expires in 5 minutes.
+          </p>
+          <input
+            type="text"
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            pattern="\d*"
+            maxLength={4}
+            placeholder="••••"
+            value={pin}
+            onChange={e => handlePinChange(e.target.value)}
+            autoFocus
+            disabled={verifying}
+            style={inputStyle(theme, {
+              width: '100%', textAlign: 'center', fontSize: 30, letterSpacing: 18,
+              marginBottom: 14, fontWeight: 700, paddingLeft: 34,
+            })}
+          />
+          {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
+          <button type="submit" disabled={verifying || pin.length !== 4} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: (verifying || pin.length !== 4) ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
+            {verifying && <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />}
+            {verifying ? 'Verifying…' : 'Verify PIN'}
+          </button>
+          <button type="button" onClick={backToLogin} style={{ background: 'none', border: 'none', color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, cursor: 'pointer', letterSpacing: 1 }}>
+            ← Back to login
+          </button>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'JetBrains Mono', monospace", background: theme.bg, padding: 20, transition: 'background 0.2s ease' }}>
@@ -822,7 +1077,7 @@ function TrashPanel({ theme, onClose, onRestored }) {
 }
 
 // ── Account dropdown menu (Change Password, Staff, Lock) ──
-function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onLock }) {
+function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTelegram, onLock }) {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
@@ -869,6 +1124,7 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onLock }) 
           animation: 'fadeIn 0.12s ease both',
         }}>
           {item('🔑 Change Password', onChangePassword)}
+          {item('📲 Telegram 2FA', onOpenTelegram)}
           {isAdmin && item('👥 Manage Staff', onOpenStaff)}
           <div style={{ height: 1, background: theme.border }} />
           {item('🔒 Lock', onLock, true)}
@@ -903,6 +1159,7 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [showChangePassword, setShowChangePassword] = useState(false);
+  const [showTelegram, setShowTelegram] = useState(false);
   const [serverWaking, setServerWaking] = useState(false);
   const [openHistory, setOpenHistory] = useState({});
   const [historyData, setHistoryData] = useState({});
@@ -1095,6 +1352,7 @@ export default function App() {
         />
       )}
       {showChangePassword && <ChangePasswordModal onClose={() => setShowChangePassword(false)} theme={theme} />}
+      {showTelegram && <TelegramModal onClose={() => setShowTelegram(false)} theme={theme} />}
       {showStaffPanel && isAdmin && <StaffPanel theme={theme} currentUserId={userId} onClose={() => setShowStaffPanel(false)} />}
       {showTrash && can('can_delete_member') && <TrashPanel theme={theme} onClose={() => setShowTrash(false)} onRestored={fetchMembers} />}
 
@@ -1123,6 +1381,7 @@ export default function App() {
                 theme={theme}
                 isAdmin={isAdmin}
                 onChangePassword={() => setShowChangePassword(true)}
+                onOpenTelegram={() => setShowTelegram(true)}
                 onOpenStaff={() => setShowStaffPanel(true)}
                 onLock={() => { localStorage.removeItem('carshop_token'); localStorage.removeItem('carshop_role'); localStorage.removeItem('carshop_username'); setAuthed(false); }}
               />

@@ -65,6 +65,22 @@ async function ensureAuthTables() {
       expires_at TIMESTAMP NOT NULL
     );
   `);
+  // Telegram 2FA: chat id per staff member + a pending link code.
+  await pool.query(`
+    ALTER TABLE staff_users
+      ADD COLUMN IF NOT EXISTS telegram_chat_id BIGINT,
+      ADD COLUMN IF NOT EXISTS telegram_link_code TEXT;
+  `);
+  // Pending logins waiting on a 4-digit PIN (short-lived).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS login_challenges (
+      challenge_token TEXT PRIMARY KEY,
+      staff_id INT REFERENCES staff_users(id) ON DELETE CASCADE,
+      pin_hash TEXT NOT NULL,
+      attempts INT DEFAULT 0,
+      expires_at TIMESTAMP NOT NULL
+    );
+  `);
   // Seed default admins on first run (temp password from env or 'changeme-now').
   const count = await pool.query('SELECT COUNT(*) FROM staff_users');
   if (parseInt(count.rows[0].count) === 0) {
@@ -103,6 +119,26 @@ async function getSessionUser(token) {
   return result.rows[0] || null;
 }
 
+// ── Telegram 2FA helpers ──
+// Requires TELEGRAM_BOT_TOKEN env var (from @BotFather). If it's missing,
+// 2FA silently degrades: accounts without a linked chat log in as before,
+// and linking is disabled.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const CHALLENGE_TTL_MINUTES = 5;
+const CHALLENGE_MAX_ATTEMPTS = 5;
+
+async function sendTelegram(chatId, text) {
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Telegram send failed (${res.status}): ${body}`);
+  }
+}
+
 // Admins implicitly have every permission; Technicians use their flags.
 function can(user, permission) {
   if (!user) return false;
@@ -120,9 +156,10 @@ function requirePermission(permission) {
   };
 }
 
-// Clean out expired sessions occasionally (every hour)
+// Clean out expired sessions + stale 2FA challenges occasionally (every hour)
 setInterval(() => {
   pool.query('DELETE FROM sessions WHERE expires_at <= NOW()').catch(() => {});
+  pool.query('DELETE FROM login_challenges WHERE expires_at <= NOW()').catch(() => {});
 }, 60 * 60 * 1000);
 
 // Auto-purge trashed members older than 30 days (runs hourly + once at startup).
@@ -183,7 +220,7 @@ app.post('/api/login', loginRateLimiter, async (req, res) => {
   }
   try {
     const result = await pool.query(
-      'SELECT id, username, password_hash, role FROM staff_users WHERE LOWER(username) = LOWER($1)',
+      'SELECT id, username, password_hash, role, telegram_chat_id FROM staff_users WHERE LOWER(username) = LOWER($1)',
       [username.trim()]
     );
     const user = result.rows[0];
@@ -192,6 +229,36 @@ app.post('/api/login', loginRateLimiter, async (req, res) => {
     const hash = user?.password_hash || '$2a$12$invalidinvalidinvalidinvaliduuuuuuuuuuuuuuuuuuuuuuuuu';
     const match = await bcrypt.compare(password, hash);
     if (user && match) {
+      // ── Telegram 2FA branch ──
+      // If this staff member has linked Telegram (and the bot is configured),
+      // don't create a session yet: send a 4-digit PIN and return a short-lived
+      // challenge token. The session is created in /api/login/verify-2fa.
+      if (user.telegram_chat_id && TELEGRAM_BOT_TOKEN) {
+        const pin = String(Math.floor(1000 + Math.random() * 9000)); // 1000–9999
+        const pinHash = await bcrypt.hash(pin, 8);
+        const challengeToken = crypto.randomUUID() + crypto.randomUUID();
+
+        await pool.query(
+          `INSERT INTO login_challenges (challenge_token, staff_id, pin_hash, expires_at)
+           VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)`,
+          [challengeToken, user.id, pinHash, String(CHALLENGE_TTL_MINUTES)]
+        );
+
+        try {
+          await sendTelegram(
+            user.telegram_chat_id,
+            `🔐 Car Shop login PIN: ${pin}\n\nExpires in ${CHALLENGE_TTL_MINUTES} minutes. If this wasn't you, ignore this message and consider changing your password.`
+          );
+        } catch (tgErr) {
+          console.error('POST /api/login telegram error:', tgErr.message);
+          await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
+          return res.status(502).json({ error: 'Could not send the login PIN to Telegram. Please try again.' });
+        }
+
+        return res.json({ requires2fa: true, challengeToken, expiresInMinutes: CHALLENGE_TTL_MINUTES });
+      }
+
+      // No Telegram linked → normal single-factor login (unchanged behaviour).
       const token = await createSession(user.id, user.role);
       res.json({ success: true, token, role: user.role, username: user.username, expiresInHours: SESSION_TTL_HOURS });
     } else {
@@ -203,8 +270,58 @@ app.post('/api/login', loginRateLimiter, async (req, res) => {
   }
 });
 
+// ── Verify the 4-digit PIN and complete login (public: user isn't logged in yet) ──
+app.post('/api/login/verify-2fa', loginRateLimiter, async (req, res) => {
+  const { challengeToken, pin } = req.body || {};
+  if (!challengeToken || !/^\d{4}$/.test(String(pin || ''))) {
+    return res.status(400).json({ error: 'Enter the 4-digit PIN.' });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT c.challenge_token, c.staff_id, c.pin_hash, c.attempts, c.expires_at,
+              u.role, u.username
+         FROM login_challenges c
+         JOIN staff_users u ON u.id = c.staff_id
+        WHERE c.challenge_token = $1`,
+      [challengeToken]
+    );
+    const ch = result.rows[0];
+
+    if (!ch || new Date(ch.expires_at) <= new Date()) {
+      if (ch) await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
+      return res.status(401).json({ error: 'PIN expired. Please log in again.', restart: true });
+    }
+    if (ch.attempts >= CHALLENGE_MAX_ATTEMPTS) {
+      await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
+      return res.status(401).json({ error: 'Too many wrong PINs. Please log in again.', restart: true });
+    }
+
+    const match = await bcrypt.compare(String(pin), ch.pin_hash);
+    if (!match) {
+      await pool.query(
+        'UPDATE login_challenges SET attempts = attempts + 1 WHERE challenge_token = $1',
+        [challengeToken]
+      );
+      const left = CHALLENGE_MAX_ATTEMPTS - (ch.attempts + 1);
+      if (left <= 0) {
+        await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
+        return res.status(401).json({ error: 'Too many wrong PINs. Please log in again.', restart: true });
+      }
+      return res.status(401).json({ error: `Wrong PIN. ${left} attempt${left !== 1 ? 's' : ''} left.` });
+    }
+
+    // Success: burn the challenge, then create a normal session.
+    await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]);
+    const token = await createSession(ch.staff_id, ch.role);
+    res.json({ success: true, token, role: ch.role, username: ch.username, expiresInHours: SESSION_TTL_HOURS });
+  } catch (err) {
+    console.error('POST /api/login/verify-2fa error:', err.message);
+    res.status(500).json({ error: 'Could not verify PIN. Please try again.' });
+  }
+});
+
 app.use('/api', async (req, res, next) => {
-  if (req.path === '/login') return next();
+  if (req.path === '/login' || req.path === '/login/verify-2fa') return next();
   try {
     const user = await getSessionUser(req.headers['x-admin-token']);
     if (!user) {
@@ -265,6 +382,103 @@ app.get('/api/me', (req, res) => {
       can_deduct_points: can(u, 'can_deduct_points'),
     },
   });
+});
+
+// ── Telegram 2FA linking (any logged-in staff manages their own) ──
+
+// Status: is the bot configured, and is MY account linked?
+app.get('/api/telegram/status', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT telegram_chat_id, telegram_link_code FROM staff_users WHERE id = $1',
+      [req.user.id]
+    );
+    const row = result.rows[0] || {};
+    res.json({
+      botConfigured: !!TELEGRAM_BOT_TOKEN,
+      linked: !!row.telegram_chat_id,
+      pendingCode: row.telegram_link_code || null,
+    });
+  } catch (err) {
+    console.error('GET /api/telegram/status error:', err.message);
+    res.status(500).json({ error: 'Could not load Telegram status.' });
+  }
+});
+
+// Step 1: generate a one-time link code the staff member sends to the bot.
+app.post('/api/telegram/link-code', async (req, res) => {
+  if (!TELEGRAM_BOT_TOKEN) {
+    return res.status(400).json({ error: 'Telegram bot is not configured on the server.' });
+  }
+  try {
+    const code = 'CS-' + crypto.randomBytes(3).toString('hex').toUpperCase(); // e.g. CS-A3F91B
+    await pool.query('UPDATE staff_users SET telegram_link_code = $1 WHERE id = $2', [code, req.user.id]);
+    res.json({ success: true, code });
+  } catch (err) {
+    console.error('POST /api/telegram/link-code error:', err.message);
+    res.status(500).json({ error: 'Could not create link code.' });
+  }
+});
+
+// Step 2: after the staff member has sent the code to the bot in Telegram,
+// they press "Confirm" — we scan recent bot messages for the code and
+// capture the sender's chat id.
+app.post('/api/telegram/confirm-link', async (req, res) => {
+  if (!TELEGRAM_BOT_TOKEN) {
+    return res.status(400).json({ error: 'Telegram bot is not configured on the server.' });
+  }
+  try {
+    const result = await pool.query(
+      'SELECT telegram_link_code FROM staff_users WHERE id = $1',
+      [req.user.id]
+    );
+    const code = result.rows[0]?.telegram_link_code;
+    if (!code) return res.status(400).json({ error: 'No pending link code. Generate one first.' });
+
+    const tgRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=100`);
+    if (!tgRes.ok) throw new Error(`getUpdates ${tgRes.status}`);
+    const data = await tgRes.json();
+
+    // Newest first; match the exact code (case-insensitive, trimmed).
+    const updates = (data.result || []).slice().reverse();
+    const hit = updates.find(u => (u.message?.text || '').trim().toUpperCase() === code.toUpperCase());
+    if (!hit) {
+      return res.status(404).json({ error: `Code not received yet. In Telegram, send ${code} to the bot, then press Confirm again.` });
+    }
+
+    const chatId = hit.message.chat.id;
+    await pool.query(
+      'UPDATE staff_users SET telegram_chat_id = $1, telegram_link_code = NULL WHERE id = $2',
+      [chatId, req.user.id]
+    );
+    await sendTelegram(chatId, `✅ Telegram linked to Car Shop staff account "${req.user.username}". You'll now receive a 4-digit PIN on every login.`).catch(() => {});
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/telegram/confirm-link error:', err.message);
+    res.status(500).json({ error: 'Could not confirm the link. Please try again.' });
+  }
+});
+
+// Unlink: turns 2FA off for this account (password required, so a stolen
+// session token alone can't silently remove 2FA).
+app.post('/api/telegram/unlink', async (req, res) => {
+  const { password } = req.body || {};
+  try {
+    const result = await pool.query('SELECT password_hash, telegram_chat_id FROM staff_users WHERE id = $1', [req.user.id]);
+    const row = result.rows[0];
+    if (!row?.telegram_chat_id) return res.status(400).json({ error: 'Telegram is not linked.' });
+    const match = await bcrypt.compare(password || '', row.password_hash || '');
+    if (!match) return res.status(401).json({ error: 'Password is incorrect.' });
+
+    await pool.query(
+      'UPDATE staff_users SET telegram_chat_id = NULL, telegram_link_code = NULL WHERE id = $1',
+      [req.user.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/telegram/unlink error:', err.message);
+    res.status(500).json({ error: 'Could not unlink Telegram.' });
+  }
 });
 
 // ── Staff management (Admin only) ──
