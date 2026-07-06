@@ -223,9 +223,11 @@ function ChangePasswordModal({ onClose, theme }) {
 }
 
 // ── Points panel with earn/redeem tabs ──
-function PointsPanel({ memberId, theme, pointsValue, descriptionValue, onPointsChange, onDescriptionChange, onApply, canAdd = true, canDeduct = true }) {
+function PointsPanel({ memberId, theme, cars = [], pointsValue, descriptionValue, onPointsChange, onDescriptionChange, onApply, canAdd = true, canDeduct = true }) {
   const [tab, setTab] = useState(canAdd ? 'earn' : 'redeem');
   const [selectedPreset, setSelectedPreset] = useState(null);
+  // Auto-select the only car; otherwise start unselected (staff must pick).
+  const [selectedCarId, setSelectedCarId] = useState(cars.length === 1 ? cars[0].car_id : null);
   const isRedeem = tab === 'redeem';
   const presets = isRedeem ? REDEEM_PRESETS : SERVICE_PRESETS;
   const tabAccent = isRedeem ? '#ef4444' : theme.accent;
@@ -238,6 +240,15 @@ function PointsPanel({ memberId, theme, pointsValue, descriptionValue, onPointsC
   };
 
   const switchTab = (t) => { setTab(t); setSelectedPreset(null); onPointsChange(''); onDescriptionChange(''); };
+
+  const handleApply = () => {
+    // Earning requires a car if the member has any cars registered.
+    if (!isRedeem && cars.length > 0 && !selectedCarId) {
+      toast('Select which car this service was for.', 'warn');
+      return;
+    }
+    onApply(isRedeem ? null : selectedCarId);
+  };
 
   return (
     <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${theme.border}`, animation: 'fadeIn 0.2s ease both' }}>
@@ -276,15 +287,38 @@ function PointsPanel({ memberId, theme, pointsValue, descriptionValue, onPointsC
         })}
       </div>
 
+      {/* Car selector — only when earning and the member has more than one car */}
+      {!isRedeem && cars.length > 1 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 2, marginBottom: 8, textTransform: 'uppercase' }}>Which car?</div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {cars.map(car => {
+              const active = selectedCarId === car.car_id;
+              return (
+                <button key={car.car_id} onClick={() => setSelectedCarId(car.car_id)} style={{
+                  padding: '8px 14px', borderRadius: 8, fontSize: 13, cursor: 'pointer',
+                  fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, textAlign: 'left',
+                  border: `1px solid ${active ? theme.accent : theme.border}`,
+                  background: active ? `${theme.accent}18` : theme.inputBg,
+                  color: active ? theme.accent : theme.textDim,
+                }}>
+                  🚗 {car.car_plate ? car.car_plate.toUpperCase() : '(no plate)'}{car.car_model ? ` · ${car.car_model}` : ''}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
         <input type="text" placeholder={isRedeem ? 'Redemption description…' : 'Description (e.g. LED Install)'}
           value={descriptionValue} onChange={e => { onDescriptionChange(e.target.value); setSelectedPreset(null); }}
           style={inputStyle(theme, { flex: '2 1 180px' })} />
         <input type="number" placeholder={isRedeem ? 'Points to deduct' : 'Points to add'}
           value={pointsValue} onChange={e => onPointsChange(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && onApply()}
+          onKeyDown={e => e.key === 'Enter' && handleApply()}
           style={inputStyle(theme, { width: 130, textAlign: 'center', color: isRedeem && pointsValue && parseInt(pointsValue) < 0 ? '#ef4444' : theme.text })} />
-        <button onClick={onApply} style={btnStyle(isRedeem ? '#ef4444' : theme.accent, isRedeem ? '#fff' : theme.bg)}>
+        <button onClick={handleApply} style={btnStyle(isRedeem ? '#ef4444' : theme.accent, isRedeem ? '#fff' : theme.bg)}>
           {isRedeem ? 'Redeem' : 'Apply'}
         </button>
       </div>
@@ -437,7 +471,12 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme }) {
                 background: theme.inputBg, border: `1px solid ${theme.border}`, borderRadius: 8, padding: '10px 14px', fontSize: 13,
               }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                  <span style={{ color: theme.text }}>{tx.description || 'No description'}</span>
+                  <span style={{ color: theme.text }}>
+                    {tx.description || 'No description'}
+                    {tx.car_plate && (
+                      <span style={{ color: '#f59e0b', fontSize: 12 }}> · 🚗 {tx.car_plate.toUpperCase()}{tx.car_model ? ` (${tx.car_model})` : ''}</span>
+                    )}
+                  </span>
                   <span style={{ color: theme.textFaint, fontSize: 11 }}>
                     {formatDateTime(tx.transaction_date)}{tx.staff_name ? ` · by ${tx.staff_name}` : ''}
                   </span>
@@ -947,7 +986,7 @@ export default function App() {
     }
   };
 
-  const handleUpdatePoints = async (id) => {
+  const handleUpdatePoints = async (id, carId = null) => {
     const pts = parseInt(adjustments[id], 10);
     if (isNaN(pts)) { toast('Enter a number first', 'warn'); return; }
     if (pts < 0) {
@@ -962,7 +1001,7 @@ export default function App() {
     try {
       await apiFetch('/api/add-points', {
         method: 'POST',
-        body: JSON.stringify({ memberId: id, points: pts, description }),
+        body: JSON.stringify({ memberId: id, points: pts, description, carId }),
       });
       toast(`${pts >= 0 ? '+' : ''}${pts} pts · ${description}`);
       setAdjustments(prev => ({ ...prev, [id]: '' }));
@@ -1199,13 +1238,14 @@ export default function App() {
                     <PointsPanel
                       memberId={member.member_id}
                       theme={theme}
+                      cars={member.cars || []}
                       canAdd={can('can_add_points')}
                       canDeduct={can('can_deduct_points')}
                       pointsValue={adjustments[member.member_id] || ''}
                       descriptionValue={descriptions[member.member_id] || ''}
                       onPointsChange={v => setAdjustments(prev => ({ ...prev, [member.member_id]: v }))}
                       onDescriptionChange={v => setDescriptions(prev => ({ ...prev, [member.member_id]: v }))}
-                      onApply={() => handleUpdatePoints(member.member_id)}
+                      onApply={(carId) => handleUpdatePoints(member.member_id, carId)}
                     />
                   )}
 

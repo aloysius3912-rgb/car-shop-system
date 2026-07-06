@@ -493,7 +493,7 @@ app.delete('/api/delete-car/:carId', async (req, res) => {
 
 // ── Add or deduct points ──
 app.post('/api/add-points', async (req, res) => {
-  const { memberId, points, description } = req.body;
+  const { memberId, points, description, carId } = req.body;
   const numericPoints = parseInt(points, 10) || 0;
 
   // Enforce add vs deduct permission based on the sign of the points.
@@ -501,6 +501,10 @@ app.post('/api/add-points', async (req, res) => {
   if (!can(req.user, perm)) {
     return res.status(403).json({ error: `You do not have permission to ${numericPoints < 0 ? 'deduct' : 'add'} points.` });
   }
+
+  // car_id only applies to earning (a service done on a specific car).
+  // For deductions (redemptions) it stays null.
+  const carIdToLog = numericPoints >= 0 && carId ? parseInt(carId, 10) : null;
 
   // Everything runs on ONE client inside a transaction so the balance
   // update and the history log either both happen or neither does.
@@ -537,8 +541,8 @@ app.post('/api/add-points', async (req, res) => {
     }
 
     const txResult = await client.query(
-      'INSERT INTO point_transactions (member_id, points_added, description, staff_id) VALUES ($1, $2, $3, $4) RETURNING transaction_id, points_added, description, transaction_date, staff_id',
-      [memberId, numericPoints, description, req.user.id]
+      'INSERT INTO point_transactions (member_id, points_added, description, staff_id, car_id) VALUES ($1, $2, $3, $4, $5) RETURNING transaction_id, points_added, description, transaction_date, staff_id, car_id',
+      [memberId, numericPoints, description, req.user.id, carIdToLog]
     );
 
     await client.query('COMMIT');
@@ -561,9 +565,12 @@ app.get('/api/transactions/:memberId', async (req, res) => {
   const { memberId } = req.params;
   try {
     const result = await pool.query(
-      `SELECT t.transaction_id, t.points_added, t.description, t.transaction_date, u.username AS staff_name
+      `SELECT t.transaction_id, t.points_added, t.description, t.transaction_date,
+              u.username AS staff_name,
+              c.car_plate, c.car_model
          FROM point_transactions t
          LEFT JOIN staff_users u ON u.id = t.staff_id
+         LEFT JOIN cars c ON c.car_id = t.car_id
         WHERE t.member_id = $1
         ORDER BY t.transaction_date DESC LIMIT 50`,
       [memberId]
