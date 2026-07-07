@@ -334,6 +334,10 @@ function TelegramModal({ onClose, theme }) {
                   <button onClick={() => { setShowUnlink(false); setUnlinkPassword(''); setError(''); }} style={btnStyle('#374151', '#fff')}>Cancel</button>
                 </div>
               </>
+            ) : status.required ? (
+              <p style={{ color: theme.textFaint, fontSize: 12, lineHeight: 1.6 }}>
+                🔒 2FA is required on your account by an Admin and can't be disabled here.
+              </p>
             ) : (
               <button onClick={() => setShowUnlink(true)} style={btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455' })}>
                 Unlink Telegram
@@ -663,7 +667,7 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
     localStorage.setItem('carshop_token', data.token);
     localStorage.setItem('carshop_role', data.role);
     localStorage.setItem('carshop_username', data.username);
-    onSuccess({ role: data.role, username: data.username });
+    onSuccess({ role: data.role, username: data.username, mustLink2fa: !!data.mustLink2fa });
   };
 
   const handleSubmit = async (e) => {
@@ -758,14 +762,15 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
             autoComplete="one-time-code"
             pattern="\d*"
             maxLength={4}
-            placeholder="••••"
+            placeholder="0000"
             value={pin}
             onChange={e => handlePinChange(e.target.value)}
             autoFocus
             disabled={verifying}
             style={inputStyle(theme, {
-              width: '100%', textAlign: 'center', fontSize: 30, letterSpacing: 18,
-              marginBottom: 14, fontWeight: 700, paddingLeft: 34,
+              width: 170, textAlign: 'center', fontSize: 24, letterSpacing: 10,
+              margin: '0 auto 14px', display: 'block', fontWeight: 700,
+              padding: '10px 0 10px 10px',
             })}
           />
           {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
@@ -898,6 +903,31 @@ function StaffPanel({ theme, currentUserId, onClose }) {
     }
   };
 
+  const toggleRequire2fa = async (member) => {
+    const next = !member.require_2fa;
+    setStaff(prev => prev.map(s => s.id === member.id ? { ...s, require_2fa: next } : s)); // optimistic
+    try {
+      await apiFetch(`/api/staff/${member.id}/require-2fa`, {
+        method: 'POST', body: JSON.stringify({ required: next }),
+      });
+      toast(next ? `🔐 2FA now required for ${member.username}.` : `2FA requirement removed for ${member.username}.`, next ? 'success' : 'warn');
+    } catch (err) {
+      toast(`Update failed: ${err.message}`, 'error');
+      load(); // revert
+    }
+  };
+
+  const unlinkTelegram = async (member) => {
+    if (!window.confirm(`Remove ${member.username}'s Telegram link? They'll be logged out and can log in with password only (until they re-link).`)) return;
+    try {
+      await apiFetch(`/api/staff/${member.id}/unlink-telegram`, { method: 'POST' });
+      toast(`${member.username}'s Telegram unlinked.`, 'warn');
+      load();
+    } catch (err) {
+      toast(`Unlink failed: ${err.message}`, 'error');
+    }
+  };
+
   const deleteStaff = async (member) => {
     if (!window.confirm(`Delete staff account "${member.username}"? This cannot be undone.`)) return;
     try {
@@ -923,13 +953,32 @@ function StaffPanel({ theme, currentUserId, onClose }) {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 20 }}>
             {staff.map(member => (
               <div key={member.id} style={{ background: theme.inputBg, border: `1px solid ${theme.border}`, borderRadius: 10, padding: '14px 16px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: member.role === 'Admin' ? 0 : 10 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                     <span style={{ fontWeight: 700, color: theme.text }}>{member.username}</span>
                     <span style={{ background: `${member.role === 'Admin' ? '#f59e0b' : theme.accent}18`, color: member.role === 'Admin' ? '#f59e0b' : theme.accent, border: `1px solid ${member.role === 'Admin' ? '#f59e0b' : theme.accent}44`, padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700 }}>{member.role}</span>
+                    <span style={{
+                      background: member.telegram_linked ? '#10b98118' : `${theme.textFaint}18`,
+                      color: member.telegram_linked ? '#10b981' : theme.textFaint,
+                      border: `1px solid ${member.telegram_linked ? '#10b98144' : theme.border}`,
+                      padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700,
+                    }}>
+                      📲 {member.telegram_linked ? '2FA ON' : 'NO 2FA'}
+                    </span>
                     {member.id === currentUserId && <span style={{ fontSize: 10, color: theme.textFaint }}>(you)</span>}
                   </div>
-                  <div style={{ display: 'flex', gap: 6 }}>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    <button onClick={() => toggleRequire2fa(member)} title="When required, this user is pushed to link Telegram at login and cannot unlink it themselves." style={{
+                      background: member.require_2fa ? '#f59e0b18' : 'none',
+                      border: `1px solid ${member.require_2fa ? '#f59e0b55' : theme.border}`,
+                      color: member.require_2fa ? '#f59e0b' : theme.textDim,
+                      borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
+                    }}>
+                      {member.require_2fa ? '🔐 2FA Required' : 'Require 2FA'}
+                    </button>
+                    {member.telegram_linked && (
+                      <button onClick={() => unlinkTelegram(member)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textDim, borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>Unlink TG</button>
+                    )}
                     <button onClick={() => resetPassword(member)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textDim, borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>Reset PW</button>
                     {member.id !== currentUserId && (
                       <button onClick={() => deleteStaff(member)} style={{ background: 'none', border: '1px solid #ef444455', color: '#ef4444', borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>Delete</button>
@@ -1322,7 +1371,13 @@ export default function App() {
   if (!authed) {
     return (
       <LoginScreen
-        onSuccess={({ role, username }) => { setUserRole(role); setUserName(username); setAuthed(true); }}
+        onSuccess={({ role, username, mustLink2fa }) => {
+          setUserRole(role); setUserName(username); setAuthed(true);
+          if (mustLink2fa) {
+            setShowTelegram(true);
+            toast('⚠️ An Admin requires Telegram 2FA on your account. Please link it now.', 'warn');
+          }
+        }}
         theme={theme} themeName={themeName} onToggleTheme={toggleTheme}
       />
     );

@@ -69,7 +69,8 @@ async function ensureAuthTables() {
   await pool.query(`
     ALTER TABLE staff_users
       ADD COLUMN IF NOT EXISTS telegram_chat_id BIGINT,
-      ADD COLUMN IF NOT EXISTS telegram_link_code TEXT;
+      ADD COLUMN IF NOT EXISTS telegram_link_code TEXT,
+      ADD COLUMN IF NOT EXISTS require_2fa BOOLEAN DEFAULT false;
   `);
   // Pending logins waiting on a 4-digit PIN (short-lived).
   await pool.query(`
@@ -220,7 +221,7 @@ app.post('/api/login', loginRateLimiter, async (req, res) => {
   }
   try {
     const result = await pool.query(
-      'SELECT id, username, password_hash, role, telegram_chat_id FROM staff_users WHERE LOWER(username) = LOWER($1)',
+      'SELECT id, username, password_hash, role, telegram_chat_id, require_2fa FROM staff_users WHERE LOWER(username) = LOWER($1)',
       [username.trim()]
     );
     const user = result.rows[0];
@@ -259,8 +260,14 @@ app.post('/api/login', loginRateLimiter, async (req, res) => {
       }
 
       // No Telegram linked → normal single-factor login (unchanged behaviour).
+      // If an Admin has flagged this account as requiring 2FA, tell the
+      // frontend so it can push the user through linking right away.
       const token = await createSession(user.id, user.role);
-      res.json({ success: true, token, role: user.role, username: user.username, expiresInHours: SESSION_TTL_HOURS });
+      res.json({
+        success: true, token, role: user.role, username: user.username,
+        expiresInHours: SESSION_TTL_HOURS,
+        mustLink2fa: !!user.require_2fa && !!TELEGRAM_BOT_TOKEN,
+      });
     } else {
       res.status(401).json({ error: 'Incorrect username or password' });
     }
@@ -390,7 +397,7 @@ app.get('/api/me', (req, res) => {
 app.get('/api/telegram/status', async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT telegram_chat_id, telegram_link_code FROM staff_users WHERE id = $1',
+      'SELECT telegram_chat_id, telegram_link_code, require_2fa FROM staff_users WHERE id = $1',
       [req.user.id]
     );
     const row = result.rows[0] || {};
@@ -398,6 +405,7 @@ app.get('/api/telegram/status', async (req, res) => {
       botConfigured: !!TELEGRAM_BOT_TOKEN,
       linked: !!row.telegram_chat_id,
       pendingCode: row.telegram_link_code || null,
+      required: !!row.require_2fa,
     });
   } catch (err) {
     console.error('GET /api/telegram/status error:', err.message);
@@ -464,9 +472,12 @@ app.post('/api/telegram/confirm-link', async (req, res) => {
 app.post('/api/telegram/unlink', async (req, res) => {
   const { password } = req.body || {};
   try {
-    const result = await pool.query('SELECT password_hash, telegram_chat_id FROM staff_users WHERE id = $1', [req.user.id]);
+    const result = await pool.query('SELECT password_hash, telegram_chat_id, require_2fa FROM staff_users WHERE id = $1', [req.user.id]);
     const row = result.rows[0];
     if (!row?.telegram_chat_id) return res.status(400).json({ error: 'Telegram is not linked.' });
+    if (row.require_2fa && req.user.role !== 'Admin') {
+      return res.status(403).json({ error: '2FA is required for your account by an Admin and cannot be disabled.' });
+    }
     const match = await bcrypt.compare(password || '', row.password_hash || '');
     if (!match) return res.status(401).json({ error: 'Password is incorrect.' });
 
@@ -486,7 +497,8 @@ app.get('/api/staff', requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, username, role, can_add_member, can_delete_member,
-              can_add_points, can_deduct_points, created_at
+              can_add_points, can_deduct_points, created_at,
+              require_2fa, (telegram_chat_id IS NOT NULL) AS telegram_linked
          FROM staff_users ORDER BY created_at ASC`
     );
     res.json(result.rows);
@@ -539,6 +551,44 @@ app.put('/api/staff/:id', requireAdmin, async (req, res) => {
   } catch (err) {
     console.error('PUT /api/staff error:', err.message);
     res.status(500).json({ error: 'Could not update staff account.' });
+  }
+});
+
+// ── Admin: require (or stop requiring) Telegram 2FA for a staff member ──
+// "Required" means: once linked they can't unlink themselves, and until
+// they link, the app pushes them through setup on every login.
+app.post('/api/staff/:id/require-2fa', requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { required } = req.body || {};
+  try {
+    const result = await pool.query(
+      'UPDATE staff_users SET require_2fa = $2 WHERE id = $1 RETURNING id',
+      [id, !!required]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
+    res.json({ success: true, required: !!required });
+  } catch (err) {
+    console.error('POST /api/staff require-2fa error:', err.message);
+    res.status(500).json({ error: 'Could not update 2FA requirement.' });
+  }
+});
+
+// ── Admin: forcibly remove a staff member's Telegram link ──
+// (e.g. they lost their phone / changed Telegram account). Their sessions
+// are wiped so the change takes effect immediately.
+app.post('/api/staff/:id/unlink-telegram', requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      'UPDATE staff_users SET telegram_chat_id = NULL, telegram_link_code = NULL WHERE id = $1 RETURNING username',
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
+    await pool.query('DELETE FROM sessions WHERE staff_id = $1', [id]); // force re-login
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/staff unlink-telegram error:', err.message);
+    res.status(500).json({ error: 'Could not unlink Telegram for that account.' });
   }
 });
 
