@@ -895,6 +895,32 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
     }
   };
 
+  const changeRole = async (member, newRole) => {
+    if (newRole === member.role) return;
+    const verb = { Master: 'promote', Admin: newRole === 'Admin' && member.role === 'Master' ? 'demote' : 'change', Technician: 'demote' }[newRole] || 'change';
+    if (!window.confirm(`${verb === 'promote' ? 'Promote' : verb === 'demote' ? 'Demote' : 'Change'} ${member.username} to ${newRole}?`)) return;
+    setStaff(prev => prev.map(s => s.id === member.id ? { ...s, role: newRole } : s)); // optimistic
+    try {
+      await apiFetch(`/api/staff/${member.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          role: newRole,
+          permissions: {
+            can_add_member: member.can_add_member,
+            can_delete_member: member.can_delete_member,
+            can_add_points: member.can_add_points,
+            can_deduct_points: member.can_deduct_points,
+          },
+        }),
+      });
+      toast(`${member.username} is now ${newRole === 'Master' ? 'a 👑 Master' : newRole === 'Admin' ? 'an Admin' : 'a Technician'}.`);
+      load();
+    } catch (err) {
+      toast(`Role change failed: ${err.message}`, 'error');
+      load(); // revert
+    }
+  };
+
   const resetPassword = async (member) => {
     const np = window.prompt(`New password for ${member.username} (min 10 chars):`);
     if (!np) return;
@@ -961,7 +987,24 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                     <span style={{ fontWeight: 700, color: theme.text }}>{member.username}</span>
-                    <span style={{ background: `${roleColor(member.role)}18`, color: roleColor(member.role), border: `1px solid ${roleColor(member.role)}44`, padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700 }}>{member.role === 'Master' ? '👑 MASTER' : member.role}</span>
+                    {isMaster && member.id !== currentUserId ? (
+                      <select
+                        value={member.role}
+                        onChange={e => changeRole(member, e.target.value)}
+                        title="Change this staff member's role"
+                        style={{
+                          background: `${roleColor(member.role)}18`, color: roleColor(member.role),
+                          border: `1px solid ${roleColor(member.role)}44`, padding: '2px 6px',
+                          borderRadius: 6, fontSize: 10, fontWeight: 700, cursor: 'pointer',
+                          fontFamily: "'JetBrains Mono', monospace",
+                        }}>
+                        <option value="Technician">Technician</option>
+                        <option value="Admin">Admin</option>
+                        <option value="Master">👑 Master</option>
+                      </select>
+                    ) : (
+                      <span style={{ background: `${roleColor(member.role)}18`, color: roleColor(member.role), border: `1px solid ${roleColor(member.role)}44`, padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700 }}>{member.role === 'Master' ? '👑 MASTER' : member.role}</span>
+                    )}
                     <span style={{
                       background: member.telegram_linked ? '#10b98118' : `${theme.textFaint}18`,
                       color: member.telegram_linked ? '#10b981' : theme.textFaint,
