@@ -1126,7 +1126,7 @@ function TrashPanel({ theme, onClose, onRestored }) {
 }
 
 // ── Account dropdown menu (Change Password, Staff, Lock) ──
-function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTelegram, onLock }) {
+function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTelegram, onSignOut }) {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
@@ -1176,7 +1176,7 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTele
           {item('📲 Telegram 2FA', onOpenTelegram)}
           {isAdmin && item('👥 Manage Staff', onOpenStaff)}
           <div style={{ height: 1, background: theme.border }} />
-          {item('🔒 sign out', onLock, true)}
+          {item('Sign out', onSignOut, true)}
         </div>
       )}
     </div>
