@@ -522,11 +522,14 @@ app.post('/api/telegram/unlink', async (req, res) => {
 // ── Staff management (Admin only) ──
 app.get('/api/staff', requireAdmin, async (req, res) => {
   try {
+    // Master accounts are invisible to everyone below Master — Admins and
+    // Technicians shouldn't even know owner accounts exist.
+    const hideMasters = req.user.role !== 'Master' ? "WHERE role <> 'Master'" : '';
     const result = await pool.query(
       `SELECT id, username, role, can_add_member, can_delete_member,
               can_add_points, can_deduct_points, created_at,
               require_2fa, (telegram_chat_id IS NOT NULL) AS telegram_linked
-         FROM staff_users ORDER BY created_at ASC`
+         FROM staff_users ${hideMasters} ORDER BY created_at ASC`
     );
     res.json(result.rows);
   } catch (err) {
