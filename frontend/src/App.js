@@ -823,7 +823,12 @@ const PERMISSION_LABELS = [
   ['can_deduct_points', 'Redeem points'],
 ];
 
-function StaffPanel({ theme, currentUserId, onClose }) {
+function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
+  const RANK = { Master: 3, Admin: 2, Technician: 1 };
+  const isMaster = currentUserRole === 'Master';
+  // Masters manage everyone; Admins manage Technicians only.
+  const canManage = (m) => isMaster || m.role === 'Technician';
+  const roleColor = (r) => r === 'Master' ? '#a78bfa' : r === 'Admin' ? '#f59e0b' : theme.accent;
   const [staff, setStaff] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
@@ -956,7 +961,7 @@ function StaffPanel({ theme, currentUserId, onClose }) {
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 10 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                     <span style={{ fontWeight: 700, color: theme.text }}>{member.username}</span>
-                    <span style={{ background: `${member.role === 'Admin' ? '#f59e0b' : theme.accent}18`, color: member.role === 'Admin' ? '#f59e0b' : theme.accent, border: `1px solid ${member.role === 'Admin' ? '#f59e0b' : theme.accent}44`, padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700 }}>{member.role}</span>
+                    <span style={{ background: `${roleColor(member.role)}18`, color: roleColor(member.role), border: `1px solid ${roleColor(member.role)}44`, padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700 }}>{member.role === 'Master' ? '👑 MASTER' : member.role}</span>
                     <span style={{
                       background: member.telegram_linked ? '#10b98118' : `${theme.textFaint}18`,
                       color: member.telegram_linked ? '#10b981' : theme.textFaint,
@@ -967,6 +972,7 @@ function StaffPanel({ theme, currentUserId, onClose }) {
                     </span>
                     {member.id === currentUserId && <span style={{ fontSize: 10, color: theme.textFaint }}>(you)</span>}
                   </div>
+                  {canManage(member) ? (
                   <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                     <button onClick={() => toggleRequire2fa(member)} title="When required, this user is pushed to link Telegram at login and cannot unlink it themselves." style={{
                       background: member.require_2fa ? '#f59e0b18' : 'none',
@@ -984,11 +990,14 @@ function StaffPanel({ theme, currentUserId, onClose }) {
                       <button onClick={() => deleteStaff(member)} style={{ background: 'none', border: '1px solid #ef444455', color: '#ef4444', borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>Delete</button>
                     )}
                   </div>
+                  ) : (
+                    <span style={{ fontSize: 10, color: theme.textFaint }}>🔒 Managed by Master</span>
+                  )}
                 </div>
-                {member.role === 'Admin' ? null : (
+                {member.role !== 'Technician' ? null : (
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                     {PERMISSION_LABELS.map(([key, label]) => (
-                      <button key={key} onClick={() => togglePerm(member, key)} style={{
+                      <button key={key} disabled={!canManage(member)} onClick={() => canManage(member) && togglePerm(member, key)} style={{
                         padding: '5px 10px', borderRadius: 6, fontSize: 11, cursor: 'pointer',
                         fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
                         border: `1px solid ${member[key] ? theme.accent : theme.border}`,
@@ -1013,7 +1022,8 @@ function StaffPanel({ theme, currentUserId, onClose }) {
               <input type="text" placeholder="Password (min 10 chars)" value={password} onChange={e => setPassword(e.target.value)} required style={inputStyle(theme, { flex: '1 1 180px' })} />
               <select value={role} onChange={e => setRole(e.target.value)} style={inputStyle(theme, { flex: '0 0 auto', cursor: 'pointer' })}>
                 <option value="Technician">Technician</option>
-                <option value="Admin">Admin</option>
+                {isMaster && <option value="Admin">Admin</option>}
+                {isMaster && <option value="Master">Master</option>}
               </select>
             </div>
             {role === 'Technician' && (
@@ -1029,7 +1039,7 @@ function StaffPanel({ theme, currentUserId, onClose }) {
                 ))}
               </div>
             )}
-            {role === 'Admin' && <p style={{ fontSize: 11, color: theme.textFaint, marginBottom: 14 }}>Admins have all permissions automatically.</p>}
+            {role !== 'Technician' && <p style={{ fontSize: 11, color: theme.textFaint, marginBottom: 14 }}>{role === 'Master' ? '👑 Masters (owners) have total control, including managing Admins.' : 'Admins have all permissions and manage Technicians.'}</p>}
             <div style={{ display: 'flex', gap: 10 }}>
               <button type="submit" disabled={creating} style={{ ...btnStyle(theme.accent, theme.bg), opacity: creating ? 0.6 : 1 }}>{creating ? 'Creating…' : 'Create Account'}</button>
               <button type="button" onClick={() => setShowCreate(false)} style={btnStyle('#374151', '#fff')}>Cancel</button>
@@ -1126,7 +1136,7 @@ function TrashPanel({ theme, onClose, onRestored }) {
 }
 
 // ── Account dropdown menu (Change Password, Staff, Lock) ──
-function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTelegram, onSignOut }) {
+function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTelegram, onLock }) {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
@@ -1176,7 +1186,7 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTele
           {item('📲 Telegram 2FA', onOpenTelegram)}
           {isAdmin && item('👥 Manage Staff', onOpenStaff)}
           <div style={{ height: 1, background: theme.border }} />
-          {item('Sign out', onSignOut, true)}
+          {item('🔒 Lock', onLock, true)}
         </div>
       )}
     </div>
@@ -1189,7 +1199,9 @@ export default function App() {
   const [userName, setUserName] = useState(localStorage.getItem('carshop_username') || '');
   const [permissions, setPermissions] = useState(null); // fetched from /api/me
   const [userId, setUserId] = useState(null);
-  const isAdmin = userRole === 'Admin';
+  const ROLE_RANK = { Master: 3, Admin: 2, Technician: 1 };
+  const isMaster = userRole === 'Master';
+  const isAdmin = (ROLE_RANK[userRole] || 0) >= 2; // Admin or Master
   const can = (perm) => isAdmin || (permissions ? !!permissions[perm] : false);
   const [showStaffPanel, setShowStaffPanel] = useState(false);
   const [showTrash, setShowTrash] = useState(false);
@@ -1408,7 +1420,7 @@ export default function App() {
       )}
       {showChangePassword && <ChangePasswordModal onClose={() => setShowChangePassword(false)} theme={theme} />}
       {showTelegram && <TelegramModal onClose={() => setShowTelegram(false)} theme={theme} />}
-      {showStaffPanel && isAdmin && <StaffPanel theme={theme} currentUserId={userId} onClose={() => setShowStaffPanel(false)} />}
+      {showStaffPanel && isAdmin && <StaffPanel theme={theme} currentUserId={userId} currentUserRole={userRole} onClose={() => setShowStaffPanel(false)} />}
       {showTrash && can('can_delete_member') && <TrashPanel theme={theme} onClose={() => setShowTrash(false)} onRestored={fetchMembers} />}
 
       <div style={{ maxWidth: 900, margin: '0 auto', padding: '40px 20px', fontFamily: "'JetBrains Mono', monospace" }}>
@@ -1426,7 +1438,7 @@ export default function App() {
             <StatusBadge connected={connected} />
             <span style={{ fontSize: 11, color: theme.textFaint }}>{filteredMembers.length} member{filteredMembers.length !== 1 ? 's' : ''}</span>
             <span style={{ fontSize: 11, color: theme.textDim }}>
-              👤 {userName} · <span style={{ color: isAdmin ? '#f59e0b' : theme.accent }}>{userRole}</span>
+              👤 {userName} · <span style={{ color: isMaster ? '#a78bfa' : userRole === 'Admin' ? '#f59e0b' : theme.accent }}>{userRole}</span>
             </span>
             <div style={{ display: 'flex', gap: 6 }}>
               {can('can_delete_member') && (

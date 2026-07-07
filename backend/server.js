@@ -49,7 +49,7 @@ async function ensureAuthTables() {
       id SERIAL PRIMARY KEY,
       username TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
-      role TEXT NOT NULL CHECK (role IN ('Admin', 'Technician')),
+      role TEXT NOT NULL CHECK (role IN ('Master', 'Admin', 'Technician')),
       can_add_member BOOLEAN DEFAULT true,
       can_delete_member BOOLEAN DEFAULT false,
       can_add_points BOOLEAN DEFAULT true,
@@ -57,6 +57,10 @@ async function ensureAuthTables() {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  // Existing databases were created with a CHECK that only allowed
+  // Admin/Technician — rebuild it so 'Master' is accepted.
+  await pool.query(`ALTER TABLE staff_users DROP CONSTRAINT IF EXISTS staff_users_role_check;`);
+  await pool.query(`ALTER TABLE staff_users ADD CONSTRAINT staff_users_role_check CHECK (role IN ('Master', 'Admin', 'Technician'));`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
@@ -82,17 +86,17 @@ async function ensureAuthTables() {
       expires_at TIMESTAMP NOT NULL
     );
   `);
-  // Seed default admins on first run (temp password from env or 'changeme-now').
+  // Seed default owner accounts on first run (temp password from env or 'changeme-now').
   const count = await pool.query('SELECT COUNT(*) FROM staff_users');
   if (parseInt(count.rows[0].count) === 0) {
     const tempHash = await bcrypt.hash(process.env.ADMIN_PASSWORD || 'changeme-now', 12);
     await pool.query(
       `INSERT INTO staff_users (username, password_hash, role) VALUES
-       ('aloysius', $1, 'Admin'),
-       ('kishen', $1, 'Admin')`,
+       ('aloysius', $1, 'Master'),
+       ('kishen', $1, 'Master')`,
       [tempHash]
     );
-    console.log('🔑 Seeded default admin accounts: aloysius, kishen (change passwords immediately).');
+    console.log('🔑 Seeded default Master accounts: aloysius, kishen (change passwords immediately).');
   }
 }
 ensureAuthTables().catch(err => console.error('Auth tables setup failed:', err.message));
@@ -140,10 +144,25 @@ async function sendTelegram(chatId, text) {
   }
 }
 
+// ── Role hierarchy ──
+// Master (owners) > Admin (shop manager) > Technician (installers).
+// Rank comparisons drive who may manage whom.
+const ROLE_RANK = { Master: 3, Admin: 2, Technician: 1 };
+const VALID_ROLES = ['Master', 'Admin', 'Technician'];
+const rank = (role) => ROLE_RANK[role] || 0;
+
+// Can `requester` manage (edit/delete/reset/2FA) the `targetRole` account?
+// Masters manage everyone. Admins manage Technicians only.
+function canManageRole(requester, targetRole) {
+  if (!requester) return false;
+  if (requester.role === 'Master') return true;
+  return requester.role === 'Admin' && targetRole === 'Technician';
+}
+
 // Admins implicitly have every permission; Technicians use their flags.
 function can(user, permission) {
   if (!user) return false;
-  if (user.role === 'Admin') return true;
+  if (user.role === 'Admin' || user.role === 'Master') return true;
   return user[permission] === true;
 }
 
@@ -341,10 +360,18 @@ app.use('/api', async (req, res, next) => {
   }
 });
 
-// ── RBAC: only Admins may pass ──
+// ── RBAC: only Admins and Masters may pass ──
 function requireAdmin(req, res, next) {
-  if (req.user?.role !== 'Admin') {
+  if (rank(req.user?.role) < ROLE_RANK.Admin) {
     return res.status(403).json({ error: 'Admin access required.' });
+  }
+  next();
+}
+
+// ── RBAC: Masters only (owner-level actions) ──
+function requireMaster(req, res, next) {
+  if (req.user?.role !== 'Master') {
+    return res.status(403).json({ error: 'Master (owner) access required.' });
   }
   next();
 }
@@ -475,8 +502,8 @@ app.post('/api/telegram/unlink', async (req, res) => {
     const result = await pool.query('SELECT password_hash, telegram_chat_id, require_2fa FROM staff_users WHERE id = $1', [req.user.id]);
     const row = result.rows[0];
     if (!row?.telegram_chat_id) return res.status(400).json({ error: 'Telegram is not linked.' });
-    if (row.require_2fa && req.user.role !== 'Admin') {
-      return res.status(403).json({ error: '2FA is required for your account by an Admin and cannot be disabled.' });
+    if (row.require_2fa && req.user.role !== 'Master') {
+      return res.status(403).json({ error: '2FA is required for your account and cannot be disabled. Ask a Master to remove it.' });
     }
     const match = await bcrypt.compare(password || '', row.password_hash || '');
     if (!match) return res.status(401).json({ error: 'Password is incorrect.' });
@@ -512,7 +539,11 @@ app.post('/api/staff', requireAdmin, async (req, res) => {
   const { username, password, role, permissions } = req.body;
   if (!username || !username.trim()) return res.status(400).json({ error: 'Username is required.' });
   if (!password || password.length < 10) return res.status(400).json({ error: 'Password must be at least 10 characters.' });
-  if (!['Admin', 'Technician'].includes(role)) return res.status(400).json({ error: 'Invalid role.' });
+  if (!VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role.' });
+  // Only a Master may create Admin or Master accounts. Admins create Technicians.
+  if (role !== 'Technician' && req.user.role !== 'Master') {
+    return res.status(403).json({ error: 'Only a Master can create Admin or Master accounts.' });
+  }
   try {
     const hash = await bcrypt.hash(password, 12);
     const p = permissions || {};
@@ -535,9 +566,29 @@ app.put('/api/staff/:id', requireAdmin, async (req, res) => {
   const { role, permissions } = req.body;
   const p = permissions || {};
   try {
-    if (role && !['Admin', 'Technician'].includes(role)) {
+    if (role && !VALID_ROLES.includes(role)) {
       return res.status(400).json({ error: 'Invalid role.' });
     }
+    const targetRes = await pool.query('SELECT role FROM staff_users WHERE id = $1', [id]);
+    const targetRole = targetRes.rows[0]?.role;
+    if (!targetRole) return res.status(404).json({ error: 'Staff member not found.' });
+
+    // Admins may only manage Technicians; Masters manage everyone.
+    if (!canManageRole(req.user, targetRole)) {
+      return res.status(403).json({ error: 'You cannot manage that account.' });
+    }
+    // Promoting to Admin/Master is a Master-only action.
+    if (role && role !== 'Technician' && role !== targetRole && req.user.role !== 'Master') {
+      return res.status(403).json({ error: 'Only a Master can assign Admin or Master roles.' });
+    }
+    // Never demote the last Master — that would orphan owner control.
+    if (targetRole === 'Master' && role && role !== 'Master') {
+      const masters = await pool.query("SELECT COUNT(*) FROM staff_users WHERE role = 'Master'");
+      if (parseInt(masters.rows[0].count) <= 1) {
+        return res.status(400).json({ error: 'Cannot demote the last Master account.' });
+      }
+    }
+
     await pool.query(
       `UPDATE staff_users
           SET role = COALESCE($2, role),
@@ -554,10 +605,29 @@ app.put('/api/staff/:id', requireAdmin, async (req, res) => {
   }
 });
 
+// ── Guard: the requester must outrank the target account ──
+// Loads the target staff row and rejects Admins acting on Admin/Master
+// accounts. Attaches req.targetStaff for the route to use.
+async function requireManageTarget(req, res, next) {
+  try {
+    const result = await pool.query('SELECT id, username, role FROM staff_users WHERE id = $1', [req.params.id]);
+    const target = result.rows[0];
+    if (!target) return res.status(404).json({ error: 'Staff member not found.' });
+    if (!canManageRole(req.user, target.role)) {
+      return res.status(403).json({ error: 'You cannot manage that account.' });
+    }
+    req.targetStaff = target;
+    next();
+  } catch (err) {
+    console.error('requireManageTarget error:', err.message);
+    res.status(500).json({ error: 'Could not verify staff account.' });
+  }
+}
+
 // ── Admin: require (or stop requiring) Telegram 2FA for a staff member ──
 // "Required" means: once linked they can't unlink themselves, and until
 // they link, the app pushes them through setup on every login.
-app.post('/api/staff/:id/require-2fa', requireAdmin, async (req, res) => {
+app.post('/api/staff/:id/require-2fa', requireAdmin, requireManageTarget, async (req, res) => {
   const { id } = req.params;
   const { required } = req.body || {};
   try {
@@ -576,7 +646,7 @@ app.post('/api/staff/:id/require-2fa', requireAdmin, async (req, res) => {
 // ── Admin: forcibly remove a staff member's Telegram link ──
 // (e.g. they lost their phone / changed Telegram account). Their sessions
 // are wiped so the change takes effect immediately.
-app.post('/api/staff/:id/unlink-telegram', requireAdmin, async (req, res) => {
+app.post('/api/staff/:id/unlink-telegram', requireAdmin, requireManageTarget, async (req, res) => {
   const { id } = req.params;
   try {
     const result = await pool.query(
@@ -592,7 +662,7 @@ app.post('/api/staff/:id/unlink-telegram', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/staff/:id/reset-password', requireAdmin, async (req, res) => {
+app.post('/api/staff/:id/reset-password', requireAdmin, requireManageTarget, async (req, res) => {
   const { id } = req.params;
   const { newPassword } = req.body;
   if (!newPassword || newPassword.length < 10) {
@@ -609,17 +679,18 @@ app.post('/api/staff/:id/reset-password', requireAdmin, async (req, res) => {
   }
 });
 
-app.delete('/api/staff/:id', requireAdmin, async (req, res) => {
+app.delete('/api/staff/:id', requireAdmin, requireManageTarget, async (req, res) => {
   const { id } = req.params;
   if (parseInt(id) === req.user.id) {
     return res.status(400).json({ error: 'You cannot delete your own account.' });
   }
   try {
-    // Don't allow deleting the last Admin
-    const admins = await pool.query("SELECT COUNT(*) FROM staff_users WHERE role = 'Admin'");
-    const target = await pool.query('SELECT role FROM staff_users WHERE id = $1', [id]);
-    if (target.rows[0]?.role === 'Admin' && parseInt(admins.rows[0].count) <= 1) {
-      return res.status(400).json({ error: 'Cannot delete the last Admin account.' });
+    // Don't allow deleting the last Master — owner control must survive.
+    if (req.targetStaff.role === 'Master') {
+      const masters = await pool.query("SELECT COUNT(*) FROM staff_users WHERE role = 'Master'");
+      if (parseInt(masters.rows[0].count) <= 1) {
+        return res.status(400).json({ error: 'Cannot delete the last Master account.' });
+      }
     }
     await pool.query('DELETE FROM staff_users WHERE id = $1', [id]);
     res.json({ success: true });
