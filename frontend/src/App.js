@@ -1176,7 +1176,7 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTele
           {item('📲 Telegram 2FA', onOpenTelegram)}
           {isAdmin && item('👥 Manage Staff', onOpenStaff)}
           <div style={{ height: 1, background: theme.border }} />
-          {item('🔒 Lock', onLock, true)}
+          {item('🔒 sign out', onLock, true)}
         </div>
       )}
     </div>
