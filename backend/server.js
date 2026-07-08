@@ -1012,51 +1012,31 @@ app.get('/api/transactions/:memberId', async (req, res) => {
   }
 });
 
-// ── Vehicle service history by plate ──
+// ── Car service history by plate ──
 // The whole point of the vehicles table: search a physical plate and see
 // every service ever done on it, across all owners and years, even if the
 // original owner has been deleted. Any logged-in staff can look this up.
-app.get('/api/vehicle-history/:plate', async (req, res) => {
+// Returns a flat array of services (newest first); [] if the plate is
+// unknown or has no services yet.
+app.get('/api/car-history/:plate', async (req, res) => {
   const plate = (req.params.plate || '').trim().toUpperCase();
   if (!plate) return res.status(400).json({ error: 'Plate is required.' });
   try {
-    const v = await pool.query('SELECT vehicle_id, plate, car_model, created_at FROM vehicles WHERE UPPER(plate) = $1', [plate]);
-    if (v.rows.length === 0) {
-      return res.json({ found: false, plate });
-    }
-    const vehicle = v.rows[0];
-
-    // Current active owner, if any (the plate may currently be unowned).
-    const owner = await pool.query(
-      `SELECT m.member_id, m.full_name
-         FROM cars c
-         JOIN members m ON m.member_id = c.member_id AND m.deleted_at IS NULL
-        WHERE c.vehicle_id = $1
-        ORDER BY c.car_id DESC LIMIT 1`,
-      [vehicle.vehicle_id]
-    );
-
-    // Full service history for this physical car (earns carry a vehicle_id;
-    // redemptions don't, so this is purely services performed on the car).
-    const history = await pool.query(
-      `SELECT t.transaction_id, t.points_added, t.description, t.transaction_date,
-              t.served_member_name, u.username AS staff_name
+    const result = await pool.query(
+      `SELECT t.transaction_id, t.transaction_date, t.description, t.points_added,
+              u.username AS staff_name,
+              t.served_member_name AS owner_at_the_time
          FROM point_transactions t
+         JOIN vehicles v ON v.vehicle_id = t.vehicle_id
          LEFT JOIN staff_users u ON u.id = t.staff_id
-        WHERE t.vehicle_id = $1
+        WHERE UPPER(v.plate) = $1
         ORDER BY t.transaction_date DESC`,
-      [vehicle.vehicle_id]
+      [plate]
     );
-
-    res.json({
-      found: true,
-      vehicle,
-      currentOwner: owner.rows[0] || null,
-      history: history.rows,
-    });
+    res.json(result.rows);
   } catch (err) {
-    console.error('GET /api/vehicle-history error:', err.message);
-    res.status(500).json({ error: 'Could not load vehicle history.' });
+    console.error('GET /api/car-history error:', err.message);
+    res.status(500).json({ error: 'Could not load car history.' });
   }
 });
 

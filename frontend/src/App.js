@@ -1235,9 +1235,12 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTele
 }
 
 // ── Plate lookup: full service history of a physical car, across all owners ──
+// Consumes GET /api/car-history/:plate — a flat array of services (newest
+// first), each: transaction_date, description, points_added, staff_name,
+// owner_at_the_time. Empty array = no history for that plate.
 function VehicleLookupModal({ onClose, theme, initialPlate = '' }) {
   const [plate, setPlate] = useState(initialPlate);
-  const [result, setResult] = useState(null);
+  const [results, setResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState('');
   const [searched, setSearched] = useState(false);
@@ -1247,11 +1250,11 @@ function VehicleLookupModal({ onClose, theme, initialPlate = '' }) {
     if (!p) return;
     setSearching(true); setError(''); setSearched(true);
     try {
-      const data = await apiFetch(`/api/vehicle-history/${encodeURIComponent(p)}`);
-      setResult(data);
+      const data = await apiFetch(`/api/car-history/${encodeURIComponent(p)}`);
+      setResults(Array.isArray(data) ? data : []);
     } catch (err) {
       setError(err.message || 'Lookup failed.');
-      setResult(null);
+      setResults([]);
     } finally {
       setSearching(false);
     }
@@ -1262,72 +1265,71 @@ function VehicleLookupModal({ onClose, theme, initialPlate = '' }) {
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', zIndex: 8888, padding: 20, overflowY: 'auto' }}>
       <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '28px 30px', maxWidth: 560, width: '100%', fontFamily: "'JetBrains Mono', monospace", marginTop: 40 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
           <h3 style={{ color: theme.text, margin: 0, fontSize: 18, fontFamily: "'Space Grotesk', sans-serif" }}>Vehicle Service History</h3>
           <button onClick={onClose} style={btnStyle('#374151', '#fff', { padding: '6px 14px' })}>Close</button>
         </div>
 
-        <p style={{ color: theme.textDim, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>
+        <p style={{ color: theme.textDim, fontSize: 12, lineHeight: 1.6, margin: '0 0 16px' }}>
           Search a licence plate to see every modification ever installed on that physical car — across all past owners, even ones no longer in the system.
         </p>
 
-        <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
           <input
             type="text" placeholder="e.g. SJK1234A" value={plate} autoFocus
             onChange={e => setPlate(e.target.value.toUpperCase())}
             onKeyDown={e => { if (e.key === 'Enter') search(); }}
             style={inputStyle(theme, { flex: 1, textTransform: 'uppercase', letterSpacing: 1 })}
           />
-          <button onClick={search} disabled={searching || !plate.trim()} style={{ ...btnStyle(theme.accent, theme.bg), opacity: (searching || !plate.trim()) ? 0.6 : 1 }}>
+          <button onClick={search} disabled={searching || !plate.trim()} style={{ ...btnStyle(theme.accent, theme.bg), opacity: (searching || !plate.trim()) ? 0.6 : 1, whiteSpace: 'nowrap' }}>
             {searching ? 'Searching…' : 'Search'}
           </button>
         </div>
 
-        {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 12 }}>{error}</div>}
-
-        {searched && !searching && result && !result.found && (
-          <div style={{ color: theme.textDim, fontSize: 14, padding: '20px 0', textAlign: 'center' }}>
-            No service history on record for <span style={{ color: theme.text, fontWeight: 700 }}>{result.plate}</span>.
+        {searching && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: theme.textDim, fontSize: 14, padding: '10px 0' }}>
+            <span style={{ width: 16, height: 16, border: `2px solid ${theme.accent}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />
+            Searching…
           </div>
         )}
 
-        {result && result.found && (
+        {!searching && error && (
+          <div style={{ color: '#ef4444', fontSize: 14, background: '#ef444411', border: '1px solid #ef444433', borderRadius: 8, padding: '12px 16px' }}>{error}</div>
+        )}
+
+        {!searching && !error && searched && results.length === 0 && (
+          <div style={{ color: theme.textDim, fontSize: 14, textAlign: 'center', padding: '28px 0', border: `1px dashed ${theme.border}`, borderRadius: 10 }}>
+            No service history found for this plate.
+          </div>
+        )}
+
+        {!searching && !error && results.length > 0 && (
           <>
-            <div style={{ background: theme.inputBg, border: `1px solid ${theme.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 16 }}>
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
-                <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 800, fontSize: 22, color: theme.text, letterSpacing: 1 }}>{result.vehicle.plate}</span>
-                {result.vehicle.car_model && <span style={{ color: theme.textDim, fontSize: 14 }}>{result.vehicle.car_model}</span>}
-              </div>
-              <div style={{ fontSize: 12, color: theme.textFaint, marginTop: 6 }}>
-                {result.currentOwner
-                  ? <>Current owner: <span style={{ color: theme.accent }}>{result.currentOwner.full_name}</span></>
-                  : <span>No active owner on file (plate is currently unregistered).</span>}
-              </div>
+            <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 2, textTransform: 'uppercase', marginBottom: 14 }}>
+              {results.length} service{results.length !== 1 ? 's' : ''} on record
             </div>
 
-            <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 2, marginBottom: 8, textTransform: 'uppercase' }}>
-              {result.history.length} service{result.history.length !== 1 ? 's' : ''} on record
-            </div>
-
-            {result.history.length === 0 ? (
-              <div style={{ color: theme.textDim, fontSize: 13, padding: '8px 0' }}>Vehicle is on file but no services have been logged against it yet.</div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 360, overflowY: 'auto' }}>
-                {result.history.map(tx => (
-                  <div key={tx.transaction_id} style={{ background: theme.inputBg, border: `1px solid ${theme.border}`, borderRadius: 8, padding: '10px 14px' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 10 }}>
-                      <span style={{ color: theme.text, fontWeight: 600, fontSize: 14 }}>{tx.description || 'Service'}</span>
-                      <span style={{ color: theme.accent, fontSize: 13, fontWeight: 700, whiteSpace: 'nowrap' }}>+{tx.points_added} pts</span>
+            <div style={{ position: 'relative', paddingLeft: 26, maxHeight: 420, overflowY: 'auto' }}>
+              <div style={{ position: 'absolute', left: 6, top: 6, bottom: 6, width: 2, background: theme.border }} />
+              {results.map((tx, i) => (
+                <div key={tx.transaction_id ?? i} style={{ position: 'relative', marginBottom: i === results.length - 1 ? 0 : 16 }}>
+                  <div style={{ position: 'absolute', left: -26, top: 16, width: 12, height: 12, borderRadius: '50%', background: theme.accent, border: `2px solid ${theme.bg}`, boxShadow: `0 0 0 2px ${theme.border}` }} />
+                  <div style={{ background: theme.inputBg, border: `1px solid ${theme.border}`, borderRadius: 10, padding: '14px 16px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12 }}>
+                      <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 16, color: theme.text }}>{tx.description || 'Service'}</span>
+                      <span style={{ color: '#34d399', fontWeight: 700, fontSize: 15, whiteSpace: 'nowrap' }}>+{tx.points_added} pts</span>
                     </div>
-                    <div style={{ fontSize: 11, color: theme.textFaint, marginTop: 4 }}>
-                      {formatDateTime(tx.transaction_date)}
-                      {tx.served_member_name ? ` · for ${tx.served_member_name}` : ''}
-                      {tx.staff_name ? ` · by ${tx.staff_name}` : ''}
-                    </div>
+                    <div style={{ color: theme.textDim, fontSize: 12, marginTop: 6 }}>{formatDateTime(tx.transaction_date)}</div>
+                    {(tx.staff_name || tx.owner_at_the_time) && (
+                      <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${theme.border}`, display: 'flex', flexWrap: 'wrap', gap: '4px 16px', fontSize: 11, color: theme.textFaint }}>
+                        {tx.staff_name && <span>Technician: {tx.staff_name}</span>}
+                        {tx.owner_at_the_time && <span>Owner at the time: {tx.owner_at_the_time}</span>}
+                      </div>
+                    )}
                   </div>
-                ))}
-              </div>
-            )}
+                </div>
+              ))}
+            </div>
           </>
         )}
       </div>
