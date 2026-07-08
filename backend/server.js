@@ -101,6 +101,78 @@ async function ensureAuthTables() {
 }
 ensureAuthTables().catch(err => console.error('Auth tables setup failed:', err.message));
 
+// ── Physical-vehicle model ──
+// A car is a physical thing that outlives its owners. `vehicles` holds the
+// physical car (keyed by plate, NEVER deleted); `cars` stays as the ownership
+// link (which member owns which vehicle right now); service history hangs off
+// vehicle_id so it survives car deletion and member purges. All steps are
+// idempotent and safe to run on every boot.
+async function ensureVehicleModel() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS vehicles (
+      vehicle_id SERIAL PRIMARY KEY,
+      plate      VARCHAR(50) NOT NULL,
+      car_model  VARCHAR(100),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS vehicles_plate_unique ON vehicles (UPPER(plate));`);
+  await pool.query(`ALTER TABLE cars ADD COLUMN IF NOT EXISTS vehicle_id INT REFERENCES vehicles(vehicle_id);`);
+  await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS vehicle_id INT REFERENCES vehicles(vehicle_id);`);
+  await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS served_member_name VARCHAR(100);`);
+
+  // Backfill vehicles from every plate we already have on file.
+  await pool.query(`
+    INSERT INTO vehicles (plate, car_model)
+    SELECT DISTINCT ON (UPPER(c.car_plate)) c.car_plate, c.car_model
+      FROM cars c
+     WHERE c.car_plate IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM vehicles v WHERE UPPER(v.plate) = UPPER(c.car_plate))
+     ORDER BY UPPER(c.car_plate), c.car_id;
+  `);
+  // Link ownership rows to their vehicle.
+  await pool.query(`
+    UPDATE cars c SET vehicle_id = v.vehicle_id
+      FROM vehicles v
+     WHERE UPPER(v.plate) = UPPER(c.car_plate) AND c.vehicle_id IS NULL;
+  `);
+  // Point historical transactions at the vehicle, and snapshot the owner name.
+  await pool.query(`
+    UPDATE point_transactions t SET vehicle_id = c.vehicle_id
+      FROM cars c
+     WHERE t.car_id = c.car_id AND t.vehicle_id IS NULL;
+  `);
+  await pool.query(`
+    UPDATE point_transactions t SET served_member_name = m.full_name
+      FROM members m
+     WHERE t.member_id = m.member_id AND t.served_member_name IS NULL;
+  `);
+  console.log('Vehicle model ready.');
+}
+ensureVehicleModel().catch(err => console.error('Vehicle model setup failed:', err.message));
+
+// Find the physical vehicle for a plate, creating it if this plate is new.
+// `db` can be the pool or a transaction client.
+async function findOrCreateVehicle(db, plate, model) {
+  if (!plate) return null;
+  const norm = plate.trim().toUpperCase();
+  const found = await db.query('SELECT vehicle_id FROM vehicles WHERE UPPER(plate) = $1', [norm]);
+  if (found.rows.length) {
+    if (model) {
+      await db.query(
+        'UPDATE vehicles SET car_model = COALESCE(car_model, $2) WHERE vehicle_id = $1',
+        [found.rows[0].vehicle_id, model.trim()]
+      );
+    }
+    return found.rows[0].vehicle_id;
+  }
+  const created = await db.query(
+    'INSERT INTO vehicles (plate, car_model) VALUES ($1, $2) RETURNING vehicle_id',
+    [norm, model ? model.trim() : null]
+  );
+  return created.rows[0].vehicle_id;
+}
+
 // ── Session helpers ──
 async function createSession(staffId, role) {
   const token = crypto.randomUUID() + crypto.randomUUID();
@@ -189,7 +261,9 @@ async function purgeOldTrash() {
       "SELECT member_id FROM members WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL '30 days'"
     );
     for (const row of old.rows) {
-      await pool.query('DELETE FROM point_transactions WHERE member_id = $1', [row.member_id]);
+      // Keep the service history: detach it from the member/car being purged
+      // (vehicle_id + served_member_name snapshot preserve the physical car's record).
+      await pool.query('UPDATE point_transactions SET member_id = NULL, car_id = NULL WHERE member_id = $1', [row.member_id]);
       await pool.query('DELETE FROM cars WHERE member_id = $1', [row.member_id]);
       await pool.query('DELETE FROM members WHERE member_id = $1', [row.member_id]);
     }
@@ -756,12 +830,13 @@ app.post('/api/new-member', requirePermission('can_add_member'), async (req, res
     );
     const newMember = memberResult.rows[0];
 
-    // Insert first car
+    // Insert first car, linked to its physical vehicle (find-or-create by plate).
     let cars = [];
     if (normalizedPlate || carModel) {
+      const vehicleId = await findOrCreateVehicle(pool, normalizedPlate, carModel);
       const carResult = await pool.query(
-        'INSERT INTO cars (member_id, car_plate, car_model) VALUES ($1, $2, $3) RETURNING *',
-        [newMember.member_id, normalizedPlate, carModel ? carModel.trim() : null]
+        'INSERT INTO cars (member_id, car_plate, car_model, vehicle_id) VALUES ($1, $2, $3, $4) RETURNING *',
+        [newMember.member_id, normalizedPlate, carModel ? carModel.trim() : null, vehicleId]
       );
       cars = carResult.rows;
     }
@@ -796,9 +871,10 @@ app.post('/api/add-car/:memberId', async (req, res) => {
       }
     }
 
+    const vehicleId = await findOrCreateVehicle(pool, normalizedPlate, carModel);
     const result = await pool.query(
-      'INSERT INTO cars (member_id, car_plate, car_model) VALUES ($1, $2, $3) RETURNING *',
-      [memberId, normalizedPlate, carModel ? carModel.trim() : null]
+      'INSERT INTO cars (member_id, car_plate, car_model, vehicle_id) VALUES ($1, $2, $3, $4) RETURNING *',
+      [memberId, normalizedPlate, carModel ? carModel.trim() : null, vehicleId]
     );
 
     const newCar = result.rows[0];
@@ -814,6 +890,10 @@ app.post('/api/add-car/:memberId', async (req, res) => {
 app.delete('/api/delete-car/:carId', async (req, res) => {
   const { carId } = req.params;
   try {
+    // Detach this car's transactions from the ownership row before deleting it.
+    // vehicle_id still carries the full service history for the physical car,
+    // so selling/removing a car never destroys what was installed on it.
+    await pool.query('UPDATE point_transactions SET car_id = NULL WHERE car_id = $1', [carId]);
     const result = await pool.query(
       'DELETE FROM cars WHERE car_id = $1 RETURNING member_id',
       [carId]
@@ -878,9 +958,21 @@ app.post('/api/add-points', async (req, res) => {
       });
     }
 
+    // Resolve the physical vehicle (durable history spine) and snapshot the
+    // owner's name so the record stays meaningful even after a member purge.
+    let vehicleIdToLog = null;
+    if (carIdToLog) {
+      const vq = await client.query('SELECT vehicle_id FROM cars WHERE car_id = $1', [carIdToLog]);
+      vehicleIdToLog = vq.rows[0]?.vehicle_id || null;
+    }
+    const nameQ = await client.query('SELECT full_name FROM members WHERE member_id = $1', [memberId]);
+    const servedName = nameQ.rows[0]?.full_name || null;
+
     const txResult = await client.query(
-      'INSERT INTO point_transactions (member_id, points_added, description, staff_id, car_id) VALUES ($1, $2, $3, $4, $5) RETURNING transaction_id, points_added, description, transaction_date, staff_id, car_id',
-      [memberId, numericPoints, description, req.user.id, carIdToLog]
+      `INSERT INTO point_transactions (member_id, points_added, description, staff_id, car_id, vehicle_id, served_member_name)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING transaction_id, points_added, description, transaction_date, staff_id, car_id`,
+      [memberId, numericPoints, description, req.user.id, carIdToLog, vehicleIdToLog, servedName]
     );
 
     await client.query('COMMIT');
@@ -917,6 +1009,54 @@ app.get('/api/transactions/:memberId', async (req, res) => {
   } catch (err) {
     console.error('GET /api/transactions error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Vehicle service history by plate ──
+// The whole point of the vehicles table: search a physical plate and see
+// every service ever done on it, across all owners and years, even if the
+// original owner has been deleted. Any logged-in staff can look this up.
+app.get('/api/vehicle-history/:plate', async (req, res) => {
+  const plate = (req.params.plate || '').trim().toUpperCase();
+  if (!plate) return res.status(400).json({ error: 'Plate is required.' });
+  try {
+    const v = await pool.query('SELECT vehicle_id, plate, car_model, created_at FROM vehicles WHERE UPPER(plate) = $1', [plate]);
+    if (v.rows.length === 0) {
+      return res.json({ found: false, plate });
+    }
+    const vehicle = v.rows[0];
+
+    // Current active owner, if any (the plate may currently be unowned).
+    const owner = await pool.query(
+      `SELECT m.member_id, m.full_name
+         FROM cars c
+         JOIN members m ON m.member_id = c.member_id AND m.deleted_at IS NULL
+        WHERE c.vehicle_id = $1
+        ORDER BY c.car_id DESC LIMIT 1`,
+      [vehicle.vehicle_id]
+    );
+
+    // Full service history for this physical car (earns carry a vehicle_id;
+    // redemptions don't, so this is purely services performed on the car).
+    const history = await pool.query(
+      `SELECT t.transaction_id, t.points_added, t.description, t.transaction_date,
+              t.served_member_name, u.username AS staff_name
+         FROM point_transactions t
+         LEFT JOIN staff_users u ON u.id = t.staff_id
+        WHERE t.vehicle_id = $1
+        ORDER BY t.transaction_date DESC`,
+      [vehicle.vehicle_id]
+    );
+
+    res.json({
+      found: true,
+      vehicle,
+      currentOwner: owner.rows[0] || null,
+      history: history.rows,
+    });
+  } catch (err) {
+    console.error('GET /api/vehicle-history error:', err.message);
+    res.status(500).json({ error: 'Could not load vehicle history.' });
   }
 });
 
@@ -984,7 +1124,9 @@ app.post('/api/restore-member/:id', requirePermission('can_delete_member'), asyn
 app.delete('/api/purge-member/:id', requirePermission('can_delete_member'), async (req, res) => {
   const memberId = req.params.id;
   try {
-    await pool.query('DELETE FROM point_transactions WHERE member_id = $1', [memberId]);
+    // Detach (don't destroy) service history — vehicle_id keeps the physical
+    // car's record alive, and served_member_name preserves who it was for.
+    await pool.query('UPDATE point_transactions SET member_id = NULL, car_id = NULL WHERE member_id = $1', [memberId]);
     await pool.query('DELETE FROM cars WHERE member_id = $1', [memberId]);
     await pool.query('DELETE FROM members WHERE member_id = $1 AND deleted_at IS NOT NULL', [memberId]);
     res.json({ success: true });

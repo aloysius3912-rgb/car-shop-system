@@ -1234,6 +1234,107 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTele
   );
 }
 
+// ── Plate lookup: full service history of a physical car, across all owners ──
+function VehicleLookupModal({ onClose, theme, initialPlate = '' }) {
+  const [plate, setPlate] = useState(initialPlate);
+  const [result, setResult] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [error, setError] = useState('');
+  const [searched, setSearched] = useState(false);
+
+  const search = async () => {
+    const p = plate.trim().toUpperCase();
+    if (!p) return;
+    setSearching(true); setError(''); setSearched(true);
+    try {
+      const data = await apiFetch(`/api/vehicle-history/${encodeURIComponent(p)}`);
+      setResult(data);
+    } catch (err) {
+      setError(err.message || 'Lookup failed.');
+      setResult(null);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  useEffect(() => { if (initialPlate) search(); /* eslint-disable-next-line */ }, []);
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', zIndex: 8888, padding: 20, overflowY: 'auto' }}>
+      <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '28px 30px', maxWidth: 560, width: '100%', fontFamily: "'JetBrains Mono', monospace", marginTop: 40 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <h3 style={{ color: theme.text, margin: 0, fontSize: 18, fontFamily: "'Space Grotesk', sans-serif" }}>Vehicle Service History</h3>
+          <button onClick={onClose} style={btnStyle('#374151', '#fff', { padding: '6px 14px' })}>Close</button>
+        </div>
+
+        <p style={{ color: theme.textDim, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>
+          Search a licence plate to see every modification ever installed on that physical car — across all past owners, even ones no longer in the system.
+        </p>
+
+        <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
+          <input
+            type="text" placeholder="e.g. SJK1234A" value={plate} autoFocus
+            onChange={e => setPlate(e.target.value.toUpperCase())}
+            onKeyDown={e => { if (e.key === 'Enter') search(); }}
+            style={inputStyle(theme, { flex: 1, textTransform: 'uppercase', letterSpacing: 1 })}
+          />
+          <button onClick={search} disabled={searching || !plate.trim()} style={{ ...btnStyle(theme.accent, theme.bg), opacity: (searching || !plate.trim()) ? 0.6 : 1 }}>
+            {searching ? 'Searching…' : 'Search'}
+          </button>
+        </div>
+
+        {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 12 }}>{error}</div>}
+
+        {searched && !searching && result && !result.found && (
+          <div style={{ color: theme.textDim, fontSize: 14, padding: '20px 0', textAlign: 'center' }}>
+            No service history on record for <span style={{ color: theme.text, fontWeight: 700 }}>{result.plate}</span>.
+          </div>
+        )}
+
+        {result && result.found && (
+          <>
+            <div style={{ background: theme.inputBg, border: `1px solid ${theme.border}`, borderRadius: 10, padding: '14px 16px', marginBottom: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
+                <span style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 800, fontSize: 22, color: theme.text, letterSpacing: 1 }}>{result.vehicle.plate}</span>
+                {result.vehicle.car_model && <span style={{ color: theme.textDim, fontSize: 14 }}>{result.vehicle.car_model}</span>}
+              </div>
+              <div style={{ fontSize: 12, color: theme.textFaint, marginTop: 6 }}>
+                {result.currentOwner
+                  ? <>Current owner: <span style={{ color: theme.accent }}>{result.currentOwner.full_name}</span></>
+                  : <span>No active owner on file (plate is currently unregistered).</span>}
+              </div>
+            </div>
+
+            <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 2, marginBottom: 8, textTransform: 'uppercase' }}>
+              {result.history.length} service{result.history.length !== 1 ? 's' : ''} on record
+            </div>
+
+            {result.history.length === 0 ? (
+              <div style={{ color: theme.textDim, fontSize: 13, padding: '8px 0' }}>Vehicle is on file but no services have been logged against it yet.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 360, overflowY: 'auto' }}>
+                {result.history.map(tx => (
+                  <div key={tx.transaction_id} style={{ background: theme.inputBg, border: `1px solid ${theme.border}`, borderRadius: 8, padding: '10px 14px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 10 }}>
+                      <span style={{ color: theme.text, fontWeight: 600, fontSize: 14 }}>{tx.description || 'Service'}</span>
+                      <span style={{ color: theme.accent, fontSize: 13, fontWeight: 700, whiteSpace: 'nowrap' }}>+{tx.points_added} pts</span>
+                    </div>
+                    <div style={{ fontSize: 11, color: theme.textFaint, marginTop: 4 }}>
+                      {formatDateTime(tx.transaction_date)}
+                      {tx.served_member_name ? ` · for ${tx.served_member_name}` : ''}
+                      {tx.staff_name ? ` · by ${tx.staff_name}` : ''}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [authed, setAuthed] = useState(!!localStorage.getItem('carshop_token'));
   const [userRole, setUserRole] = useState(localStorage.getItem('carshop_role') || '');
@@ -1262,6 +1363,7 @@ export default function App() {
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [showChangePassword, setShowChangePassword] = useState(false);
   const [showTelegram, setShowTelegram] = useState(false);
+  const [showVehicleLookup, setShowVehicleLookup] = useState(false);
   const [serverWaking, setServerWaking] = useState(false);
   const [openHistory, setOpenHistory] = useState({});
   const [historyData, setHistoryData] = useState({});
@@ -1461,6 +1563,7 @@ export default function App() {
       )}
       {showChangePassword && <ChangePasswordModal onClose={() => setShowChangePassword(false)} theme={theme} />}
       {showTelegram && <TelegramModal onClose={() => setShowTelegram(false)} theme={theme} />}
+      {showVehicleLookup && <VehicleLookupModal onClose={() => setShowVehicleLookup(false)} theme={theme} />}
       {showStaffPanel && isAdmin && <StaffPanel theme={theme} currentUserId={userId} currentUserRole={userRole} onClose={() => setShowStaffPanel(false)} />}
       {showTrash && can('can_delete_member') && <TrashPanel theme={theme} onClose={() => setShowTrash(false)} onRestored={fetchMembers} />}
 
@@ -1479,9 +1582,10 @@ export default function App() {
             <StatusBadge connected={connected} />
             <span style={{ fontSize: 11, color: theme.textFaint }}>{filteredMembers.length} member{filteredMembers.length !== 1 ? 's' : ''}</span>
             <span style={{ fontSize: 11, color: theme.textDim }}>
-              👤 {userName} · <span style={{ color: isMaster ? '#a78bfa' : userRole === 'Admin' ? '#f59e0b' : theme.accent }}>{userRole}</span>
+              {userName} · <span style={{ color: isMaster ? '#a78bfa' : userRole === 'Admin' ? '#f59e0b' : theme.accent }}>{userRole}</span>
             </span>
             <div style={{ display: 'flex', gap: 6 }}>
+              <button onClick={() => setShowVehicleLookup(true)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Plate Lookup</button>
               {can('can_delete_member') && (
                 <button onClick={() => setShowTrash(true)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Trash</button>
               )}
