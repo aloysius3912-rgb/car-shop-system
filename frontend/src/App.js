@@ -98,7 +98,7 @@ const apiFetch = (path, opts = {}) =>
 
 // ── Shared styles ──
 const btnStyle = (bg, color, extra = {}) => ({
-  padding: '10px 22px', borderRadius: 8, border: 'none', cursor: 'pointer',
+  padding: '10px 22px', borderRadius: 8, border: 'none', cursor: 'pointer', boxSizing: 'border-box',
   background: bg, color, fontWeight: 700, fontSize: 14,
   fontFamily: "'JetBrains Mono', monospace", ...extra,
 });
@@ -106,7 +106,7 @@ const btnStyle = (bg, color, extra = {}) => ({
 function inputStyle(theme, extra = {}) {
   return {
     background: theme.inputBg, border: `1px solid ${theme.border}`,
-    color: theme.text, padding: '11px 16px', borderRadius: 8,
+    color: theme.text, padding: '11px 16px', borderRadius: 8, boxSizing: 'border-box',
     fontSize: 14, fontFamily: "'JetBrains Mono', monospace", ...extra,
   };
 }
@@ -160,7 +160,6 @@ function ConfirmDialog({ title, message, onConfirm, onCancel, theme, confirmLabe
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 8888 }}>
       <div style={{ background: theme.card, border: `1px solid ${confirmColor}`, borderRadius: 14, padding: '32px 36px', maxWidth: 360, width: '90%', textAlign: 'center', fontFamily: "'JetBrains Mono', monospace" }}>
-        <div style={{ fontSize: 36, marginBottom: 12 }}>⚠️</div>
         <h3 style={{ color: theme.text, margin: '0 0 8px', fontSize: 18 }}>{title}</h3>
         <p style={{ color: theme.textDim, margin: '0 0 24px', fontSize: 14, lineHeight: 1.5 }}>{message}</p>
         <div style={{ display: 'flex', gap: 12, justifyContent: 'center' }}>
@@ -192,7 +191,7 @@ function ChangePasswordModal({ onClose, theme }) {
         body: JSON.stringify({ currentPassword, newPassword }),
       });
       localStorage.setItem('carshop_token', data.token);
-      toast('✅ Password changed successfully!');
+      toast('Password changed successfully!');
       onClose();
     } catch (err) {
       setError(err.message || 'Could not change password.');
@@ -265,7 +264,7 @@ function TelegramModal({ onClose, theme }) {
     setError('');
     try {
       await apiFetch('/api/telegram/confirm-link', { method: 'POST' });
-      toast('✅ Telegram linked! You\'ll get a PIN on every login.');
+      toast('Telegram linked! You\'ll get a PIN on every login.');
       setCode(null);
       load();
     } catch (err) {
@@ -303,7 +302,7 @@ function TelegramModal({ onClose, theme }) {
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 8888, padding: 20 }}>
       <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '32px 36px', maxWidth: 420, width: '100%', fontFamily: "'JetBrains Mono', monospace" }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
-          <h3 style={{ color: theme.text, margin: 0, fontSize: 18, fontFamily: "'Space Grotesk', sans-serif" }}>📲 Telegram 2FA</h3>
+          <h3 style={{ color: theme.text, margin: 0, fontSize: 18, fontFamily: "'Space Grotesk', sans-serif" }}>Telegram 2FA</h3>
           <button onClick={onClose} style={btnStyle('#374151', '#fff', { padding: '6px 14px' })}>Close</button>
         </div>
 
@@ -336,7 +335,7 @@ function TelegramModal({ onClose, theme }) {
               </>
             ) : status.required ? (
               <p style={{ color: theme.textFaint, fontSize: 12, lineHeight: 1.6 }}>
-                🔒 2FA is required on your account by an Admin and can't be disabled here.
+                2FA is required on your account by an Admin and can't be disabled here.
               </p>
             ) : (
               <button onClick={() => setShowUnlink(true)} style={btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455' })}>
@@ -460,7 +459,7 @@ function PointsPanel({ memberId, theme, cars = [], pointsValue, descriptionValue
                   background: active ? `${theme.accent}18` : theme.inputBg,
                   color: active ? theme.accent : theme.textDim,
                 }}>
-                  🚗 {car.car_plate ? car.car_plate.toUpperCase() : '(no plate)'}{car.car_model ? ` · ${car.car_model}` : ''}
+                  {car.car_plate ? car.car_plate.toUpperCase() : '(no plate)'}{car.car_model ? ` · ${car.car_model}` : ''}
                 </button>
               );
             })}
@@ -504,7 +503,7 @@ function CarsPanel({ member, theme, onCarAdded, onCarDeleted }) {
         body: JSON.stringify({ carPlate: newPlate.trim().toUpperCase(), carModel: newModel.trim() }),
       });
       onCarAdded(member.member_id, data.car);
-      toast(`✅ Car added to ${member.full_name}!`);
+      toast(`Car added to ${member.full_name}!`);
       setNewPlate(''); setNewModel(''); setShowAddForm(false);
     } catch (err) {
       toast(`Failed to add car: ${err.message}`, 'error');
@@ -556,7 +555,7 @@ function CarsPanel({ member, theme, onCarAdded, onCarDeleted }) {
                         {car.car_plate.toUpperCase()}
                       </span>
                     )}
-                    {car.car_model && <span style={{ fontSize: 12, color: theme.textDim }}>🚗 {car.car_model}</span>}
+                    {car.car_model && <span style={{ fontSize: 12, color: theme.textDim }}>{car.car_model}</span>}
                   </div>
                   {cars.length > 1 && (
                     <button onClick={() => setConfirmDeleteCar(car)} style={{
@@ -632,7 +631,7 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme }) {
                   <span style={{ color: theme.text }}>
                     {tx.description || 'No description'}
                     {tx.car_plate && (
-                      <span style={{ color: '#f59e0b', fontSize: 12 }}> · 🚗 {tx.car_plate.toUpperCase()}{tx.car_model ? ` (${tx.car_model})` : ''}</span>
+                      <span style={{ color: '#f59e0b', fontSize: 12 }}> · {tx.car_plate.toUpperCase()}{tx.car_model ? ` (${tx.car_model})` : ''}</span>
                     )}
                   </span>
                   <span style={{ color: theme.textFaint, fontSize: 11 }}>
@@ -748,7 +747,6 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
           <ThemeToggle theme={theme} themeName={themeName} onToggle={onToggleTheme} />
         </div>
         <form onSubmit={e => { e.preventDefault(); if (pin.length === 4) verifyPin(pin); }} style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '40px 36px', maxWidth: 360, width: '100%', textAlign: 'center' }}>
-          <div style={{ fontSize: 36, marginBottom: 10 }}>📲</div>
           <div style={{ fontSize: 11, letterSpacing: 4, color: theme.accent, marginBottom: 6, textTransform: 'uppercase' }}>Two-Factor Login</div>
           <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 24, color: theme.text, fontWeight: 800, marginBottom: 10, letterSpacing: -0.5 }}>
             Enter Telegram PIN
@@ -768,9 +766,9 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
             autoFocus
             disabled={verifying}
             style={inputStyle(theme, {
-              width: 170, textAlign: 'center', fontSize: 24, letterSpacing: 10,
-              margin: '0 auto 14px', display: 'block', fontWeight: 700,
-              padding: '10px 0 10px 10px',
+              width: '100%', textAlign: 'center', fontSize: 22, letterSpacing: 12,
+              marginBottom: 14, display: 'block', fontWeight: 700,
+              padding: '11px 0 11px 12px',
             })}
           />
           {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
@@ -807,7 +805,7 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
         {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
         <button type="submit" disabled={loading} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: loading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
           {loading && <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />}
-          {loading ? 'Checking…' : 'Unlock'}
+          {loading ? 'Checking…' : 'Login'}
         </button>
       </form>
     </div>
@@ -861,7 +859,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
         method: 'POST',
         body: JSON.stringify({ username: username.trim(), password, role, permissions: role === 'Admin' ? {} : perms }),
       });
-      toast(`✅ ${username.trim()} created!`);
+      toast(`${username.trim()} created!`);
       setUsername(''); setPassword(''); setRole('Technician');
       setPerms({ can_add_member: true, can_delete_member: false, can_add_points: true, can_deduct_points: true });
       setShowCreate(false);
@@ -913,7 +911,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
           },
         }),
       });
-      toast(`${member.username} is now ${newRole === 'Master' ? 'a 👑 Master' : newRole === 'Admin' ? 'an Admin' : 'a Technician'}.`);
+      toast(`${member.username} is now ${newRole === 'Master' ? 'a Master' : newRole === 'Admin' ? 'an Admin' : 'a Technician'}.`);
       load();
     } catch (err) {
       toast(`Role change failed: ${err.message}`, 'error');
@@ -928,7 +926,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
       await apiFetch(`/api/staff/${member.id}/reset-password`, {
         method: 'POST', body: JSON.stringify({ newPassword: np }),
       });
-      toast(`✅ Password reset for ${member.username}. They'll need to log in again.`);
+      toast(`Password reset for ${member.username}. They'll need to log in again.`);
     } catch (err) {
       toast(`Reset failed: ${err.message}`, 'error');
     }
@@ -941,7 +939,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
       await apiFetch(`/api/staff/${member.id}/require-2fa`, {
         method: 'POST', body: JSON.stringify({ required: next }),
       });
-      toast(next ? `🔐 2FA now required for ${member.username}.` : `2FA requirement removed for ${member.username}.`, next ? 'success' : 'warn');
+      toast(next ? `2FA now required for ${member.username}.` : `2FA requirement removed for ${member.username}.`, next ? 'success' : 'warn');
     } catch (err) {
       toast(`Update failed: ${err.message}`, 'error');
       load(); // revert
@@ -1000,10 +998,10 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
                         }}>
                         <option value="Technician">Technician</option>
                         <option value="Admin">Admin</option>
-                        <option value="Master">👑 Master</option>
+                        <option value="Master">Master</option>
                       </select>
                     ) : (
-                      <span style={{ background: `${roleColor(member.role)}18`, color: roleColor(member.role), border: `1px solid ${roleColor(member.role)}44`, padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700 }}>{member.role === 'Master' ? '👑 MASTER' : member.role}</span>
+                      <span style={{ background: `${roleColor(member.role)}18`, color: roleColor(member.role), border: `1px solid ${roleColor(member.role)}44`, padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700 }}>{member.role === 'Master' ? 'MASTER' : member.role}</span>
                     )}
                     <span style={{
                       background: member.telegram_linked ? '#10b98118' : `${theme.textFaint}18`,
@@ -1011,7 +1009,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
                       border: `1px solid ${member.telegram_linked ? '#10b98144' : theme.border}`,
                       padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700,
                     }}>
-                      📲 {member.telegram_linked ? '2FA ON' : 'NO 2FA'}
+                      {member.telegram_linked ? '2FA ON' : 'NO 2FA'}
                     </span>
                     {member.id === currentUserId && <span style={{ fontSize: 10, color: theme.textFaint }}>(you)</span>}
                   </div>
@@ -1023,7 +1021,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
                       color: member.require_2fa ? '#f59e0b' : theme.textDim,
                       borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
                     }}>
-                      {member.require_2fa ? '🔐 2FA Required' : 'Require 2FA'}
+                      {member.require_2fa ? '2FA Required' : 'Require 2FA'}
                     </button>
                     {member.telegram_linked && (
                       <button onClick={() => unlinkTelegram(member)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textDim, borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>Unlink TG</button>
@@ -1034,7 +1032,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
                     )}
                   </div>
                   ) : (
-                    <span style={{ fontSize: 10, color: theme.textFaint }}>🔒 Managed by Master</span>
+                    <span style={{ fontSize: 10, color: theme.textFaint }}>Managed by Master</span>
                   )}
                 </div>
                 {member.role !== 'Technician' ? null : (
@@ -1082,7 +1080,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
                 ))}
               </div>
             )}
-            {role !== 'Technician' && <p style={{ fontSize: 11, color: theme.textFaint, marginBottom: 14 }}>{role === 'Master' ? '👑 Masters (owners) have total control, including managing Admins.' : 'Admins have all permissions and manage Technicians.'}</p>}
+            {role !== 'Technician' && <p style={{ fontSize: 11, color: theme.textFaint, marginBottom: 14 }}>{role === 'Master' ? 'Masters (owners) have total control, including managing Admins.' : 'Admins have all permissions and manage Technicians.'}</p>}
             <div style={{ display: 'flex', gap: 10 }}>
               <button type="submit" disabled={creating} style={{ ...btnStyle(theme.accent, theme.bg), opacity: creating ? 0.6 : 1 }}>{creating ? 'Creating…' : 'Create Account'}</button>
               <button type="button" onClick={() => setShowCreate(false)} style={btnStyle('#374151', '#fff')}>Cancel</button>
@@ -1140,7 +1138,7 @@ function TrashPanel({ theme, onClose, onRestored }) {
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', zIndex: 8888, padding: 20, overflowY: 'auto' }}>
       <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '28px 30px', maxWidth: 620, width: '100%', margin: '40px 0', fontFamily: "'JetBrains Mono', monospace" }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-          <h3 style={{ color: theme.text, fontSize: 20, fontFamily: "'Space Grotesk', sans-serif", margin: 0 }}>🗑️ Trash Bin</h3>
+          <h3 style={{ color: theme.text, fontSize: 20, fontFamily: "'Space Grotesk', sans-serif", margin: 0 }}>Trash Bin</h3>
           <button onClick={onClose} style={btnStyle('#374151', '#fff', { padding: '6px 14px' })}>Close</button>
         </div>
         <p style={{ color: theme.textFaint, fontSize: 12, marginBottom: 20 }}>Deleted customers are kept for 30 days, then permanently removed automatically.</p>
@@ -1178,7 +1176,7 @@ function TrashPanel({ theme, onClose, onRestored }) {
   );
 }
 
-// ── Account dropdown menu (Change Password, Staff, Lock) ──
+// ── Account dropdown menu (Change Password, Staff, Sign Out) ──
 function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTelegram, onLock }) {
   const [open, setOpen] = useState(false);
 
@@ -1225,11 +1223,11 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTele
           boxShadow: '0 6px 24px rgba(0,0,0,0.3)',
           animation: 'fadeIn 0.12s ease both',
         }}>
-          {item('🔑 Change Password', onChangePassword)}
-          {item('📲 Telegram 2FA', onOpenTelegram)}
-          {isAdmin && item('👥 Manage Staff', onOpenStaff)}
+          {item('Change Password', onChangePassword)}
+          {item('Telegram 2FA', onOpenTelegram)}
+          {isAdmin && item('Manage Staff', onOpenStaff)}
           <div style={{ height: 1, background: theme.border }} />
-          {item('🔒 Lock', onLock, true)}
+          {item('Sign Out', onLock, true)}
         </div>
       )}
     </div>
@@ -1338,7 +1336,7 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({ fullName: newName.trim(), carPlate: newPlate.trim().toUpperCase(), carModel: newModel.trim() }),
       });
-      toast(`✅ ${newName.trim()} registered!`);
+      toast(`${newName.trim()} registered!`);
       setNewName(''); setNewPlate(''); setNewModel('');
     } catch (err) {
       toast(`Registration failed: ${err.message}`, 'error');
@@ -1430,7 +1428,7 @@ export default function App() {
           setUserRole(role); setUserName(username); setAuthed(true);
           if (mustLink2fa) {
             setShowTelegram(true);
-            toast('⚠️ An Admin requires Telegram 2FA on your account. Please link it now.', 'warn');
+            toast('An Admin requires Telegram 2FA on your account. Please link it now.', 'warn');
           }
         }}
         theme={theme} themeName={themeName} onToggleTheme={toggleTheme}
@@ -1456,7 +1454,7 @@ export default function App() {
       {confirmDelete && (
         <ConfirmDialog
           title="Move to Trash?"
-          message={`${confirmDelete.name} will be moved to the trash bin. You can restore them within 30 days from the 🗑️ Trash menu.`}
+          message={`${confirmDelete.name} will be moved to the trash bin. You can restore them within 30 days from the Trash menu.`}
           confirmLabel="Move to Trash"
           theme={theme} onConfirm={confirmDeleteMember} onCancel={() => setConfirmDelete(null)}
         />
@@ -1485,7 +1483,7 @@ export default function App() {
             </span>
             <div style={{ display: 'flex', gap: 6 }}>
               {can('can_delete_member') && (
-                <button onClick={() => setShowTrash(true)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>🗑️ Trash</button>
+                <button onClick={() => setShowTrash(true)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 11, letterSpacing: 1, padding: '4px 10px', borderRadius: 6, cursor: 'pointer' }}>Trash</button>
               )}
               <AccountMenu
                 theme={theme}
@@ -1576,7 +1574,7 @@ export default function App() {
                       </div>
 
                       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 8 }}>
-                        {cars[0]?.car_model && <span style={{ fontSize: 12, color: theme.textDim }}>🚗 {cars[0].car_model}</span>}
+                        {cars[0]?.car_model && <span style={{ fontSize: 12, color: theme.textDim }}>{cars[0].car_model}</span>}
                         <span style={{ fontSize: 12, color: theme.textFaint }}>📅 Joined {formatDate(member.date_joined)}</span>
                       </div>
 
