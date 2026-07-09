@@ -1240,6 +1240,8 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTele
 // returning vehicle (or a current duplicate).
 function PlateNotice({ plate, theme }) {
   const [info, setInfo] = useState(null);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [ackPlate, setAckPlate] = useState(''); // plate we've already shown the modal for
 
   useEffect(() => {
     const p = (plate || '').trim().toUpperCase();
@@ -1248,15 +1250,26 @@ function PlateNotice({ plate, theme }) {
     const timer = setTimeout(async () => {
       try {
         const data = await apiFetch(`/api/plate-precheck/${encodeURIComponent(p)}`);
-        if (!cancelled) setInfo(data && data.known ? data : null);
+        if (cancelled) return;
+        if (data && data.known) {
+          setInfo(data);
+          // Returning vehicle (known, not currently owned) → pop the modal once
+          // per plate so a busy technician can't miss it.
+          if (!data.activeOwner && p !== ackPlate) setModalOpen(true);
+        } else {
+          setInfo(null);
+        }
       } catch {
         if (!cancelled) setInfo(null);
       }
     }, 400);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [plate]);
+  }, [plate, ackPlate]);
 
-  if (!info) return null;
+  const acknowledge = () => {
+    setAckPlate((plate || '').trim().toUpperCase());
+    setModalOpen(false);
+  };
 
   const banner = (color, children) => (
     <div style={{
@@ -1266,19 +1279,38 @@ function PlateNotice({ plate, theme }) {
     }}>{children}</div>
   );
 
-  // Currently owned by someone active → it's a duplicate, not a returning car.
-  if (info.activeOwner) {
-    return banner('#f59e0b', <>This plate is <strong>currently registered</strong> to {info.activeOwner}.</>);
-  }
+  return (
+    <>
+      {/* Unmissable acknowledgment modal for returning vehicles */}
+      {modalOpen && info && !info.activeOwner && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999, padding: 20 }}>
+          <div style={{ background: theme.card, border: `2px solid ${theme.accent}`, borderRadius: 14, padding: '30px 32px', maxWidth: 440, width: '100%', fontFamily: "'JetBrains Mono', monospace", textAlign: 'center', boxShadow: `0 0 0 4px ${theme.accent}22` }}>
+            <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 4, textTransform: 'uppercase', marginBottom: 10 }}>Returning Vehicle</div>
+            <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 800, fontSize: 30, letterSpacing: 1, color: theme.text, marginBottom: 6 }}>{info.plate}</div>
+            <p style={{ color: theme.textDim, fontSize: 13.5, lineHeight: 1.7, margin: '0 0 20px' }}>
+              We've serviced this car before{info.previousOwner ? <> — it was previously <strong style={{ color: theme.text }}>{info.previousOwner}</strong>'s</> : null}.
+              {info.serviceCount ? <> There {info.serviceCount === 1 ? 'is' : 'are'} <strong style={{ color: theme.text }}>{info.serviceCount}</strong> past service{info.serviceCount !== 1 ? 's' : ''} on record{info.lastServiceDate ? <> (last {formatDate(info.lastServiceDate)})</> : null}.</> : null}
+              {' '}Its full history will carry over to the new owner automatically.
+            </p>
+            <button onClick={acknowledge} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', fontSize: 15, padding: '12px 0' }}>
+              Got it
+            </button>
+          </div>
+        </div>
+      )}
 
-  // Known vehicle, not currently owned → returning car.
-  return banner(theme.accent, <>
-    <strong>Returning vehicle</strong> — this car has been with us before
-    {info.previousOwner ? <> (previously {info.previousOwner})</> : null}
-    {info.serviceCount ? <>, {info.serviceCount} service{info.serviceCount !== 1 ? 's' : ''} on record</> : null}
-    {info.lastServiceDate ? <>, last {formatDate(info.lastServiceDate)}</> : null}.
-    {' '}Its full service history will carry over automatically.
-  </>);
+      {/* Persistent inline reminder under the input */}
+      {info && (info.activeOwner
+        ? banner('#f59e0b', <>This plate is <strong>currently registered</strong> to {info.activeOwner}.</>)
+        : banner(theme.accent, <>
+            <strong>Returning vehicle</strong> — this car has been with us before
+            {info.previousOwner ? <> (previously {info.previousOwner})</> : null}
+            {info.serviceCount ? <>, {info.serviceCount} service{info.serviceCount !== 1 ? 's' : ''} on record</> : null}
+            {info.lastServiceDate ? <>, last {formatDate(info.lastServiceDate)}</> : null}.
+            {' '}Its full service history will carry over automatically.
+          </>))}
+    </>
+  );
 }
 
 // ── Plate lookup: full service history of a physical car, across all owners ──
