@@ -492,10 +492,9 @@ function CarsPanel({ member, theme, onCarAdded, onCarDeleted }) {
   const [newModel, setNewModel] = useState('');
   const [adding, setAdding] = useState(false);
   const [confirmDeleteCar, setConfirmDeleteCar] = useState(null);
+  const [returningInfo, setReturningInfo] = useState(null); // returning-vehicle confirm gate
 
-  const handleAddCar = async (e) => {
-    e.preventDefault();
-    if (!newPlate.trim() && !newModel.trim()) { toast('Enter a plate or model', 'warn'); return; }
+  const doAddCar = async () => {
     setAdding(true);
     try {
       const data = await apiFetch(`/api/add-car/${member.member_id}`, {
@@ -505,11 +504,28 @@ function CarsPanel({ member, theme, onCarAdded, onCarDeleted }) {
       onCarAdded(member.member_id, data.car);
       toast(`Car added to ${member.full_name}!`);
       setNewPlate(''); setNewModel(''); setShowAddForm(false);
+      setReturningInfo(null);
     } catch (err) {
       toast(`Failed to add car: ${err.message}`, 'error');
     } finally {
       setAdding(false);
     }
+  };
+
+  const handleAddCar = async (e) => {
+    e.preventDefault();
+    if (!newPlate.trim() && !newModel.trim()) { toast('Enter a plate or model', 'warn'); return; }
+    const plate = newPlate.trim().toUpperCase();
+    if (plate.length >= 3) {
+      setAdding(true);
+      const pre = await apiFetch(`/api/plate-precheck/${encodeURIComponent(plate)}`).catch(() => null);
+      setAdding(false);
+      if (pre && pre.known && !pre.activeOwner) {
+        setReturningInfo(pre); // block: confirm before adding
+        return;
+      }
+    }
+    doAddCar();
   };
 
   const handleDeleteCar = async (carId) => {
@@ -605,6 +621,14 @@ function CarsPanel({ member, theme, onCarAdded, onCarDeleted }) {
           onCancel={() => setConfirmDeleteCar(null)}
         />
       )}
+
+      <ReturningVehicleConfirm
+        info={returningInfo}
+        confirmLabel="Add anyway"
+        onConfirm={doAddCar}
+        onCancel={() => setReturningInfo(null)}
+        theme={theme}
+      />
     </div>
   );
 }
@@ -1239,9 +1263,7 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTele
 // Debounced lookup against /api/plate-precheck. Silent unless the plate is a
 // returning vehicle (or a current duplicate).
 function PlateNotice({ plate, theme }) {
-  const [info, setInfo] = useState(null);   // live, drives the inline banner
-  const [alert, setAlert] = useState(null); // frozen snapshot for the modal; null = closed
-  const [ackPlate, setAckPlate] = useState(''); // plate we've already alerted for
+  const [info, setInfo] = useState(null); // live, drives the inline banner
 
   useEffect(() => {
     const p = (plate || '').trim().toUpperCase();
@@ -1250,27 +1272,15 @@ function PlateNotice({ plate, theme }) {
     const timer = setTimeout(async () => {
       try {
         const data = await apiFetch(`/api/plate-precheck/${encodeURIComponent(p)}`);
-        if (cancelled) return;
-        if (data && data.known) {
-          setInfo(data);
-          // Returning vehicle (known, not currently owned): freeze a snapshot
-          // and open the modal once per plate. Using a separate frozen state
-          // means later re-fetches/re-renders can't close it — only "Got it" can.
-          if (!data.activeOwner && p !== ackPlate) setAlert(data);
-        } else {
-          setInfo(null);
-        }
+        if (!cancelled) setInfo(data && data.known ? data : null);
       } catch {
         if (!cancelled) setInfo(null);
       }
     }, 400);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [plate, ackPlate]);
+  }, [plate]);
 
-  const acknowledge = () => {
-    setAckPlate((plate || '').trim().toUpperCase());
-    setAlert(null);
-  };
+  if (!info) return null;
 
   const banner = (color, children) => (
     <div style={{
@@ -1280,37 +1290,39 @@ function PlateNotice({ plate, theme }) {
     }}>{children}</div>
   );
 
-  return (
-    <>
-      {/* Unmissable acknowledgment modal — stays until "Got it" is clicked. */}
-      {alert && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999, padding: 20 }}>
-          <div style={{ background: theme.card, border: `2px solid ${theme.accent}`, borderRadius: 14, padding: '30px 32px', maxWidth: 440, width: '100%', fontFamily: "'JetBrains Mono', monospace", textAlign: 'center', boxShadow: `0 0 0 4px ${theme.accent}22` }}>
-            <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 4, textTransform: 'uppercase', marginBottom: 10 }}>Returning Vehicle</div>
-            <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 800, fontSize: 30, letterSpacing: 1, color: theme.text, marginBottom: 6 }}>{alert.plate}</div>
-            <p style={{ color: theme.textDim, fontSize: 13.5, lineHeight: 1.7, margin: '0 0 20px' }}>
-              We've serviced this car before{alert.previousOwner ? <> — it was previously <strong style={{ color: theme.text }}>{alert.previousOwner}</strong>'s</> : null}.
-              {alert.serviceCount ? <> There {alert.serviceCount === 1 ? 'is' : 'are'} <strong style={{ color: theme.text }}>{alert.serviceCount}</strong> past service{alert.serviceCount !== 1 ? 's' : ''} on record{alert.lastServiceDate ? <> (last {formatDate(alert.lastServiceDate)})</> : null}.</> : null}
-              {' '}Its full history will carry over to the new owner automatically.
-            </p>
-            <button type="button" autoFocus onClick={acknowledge} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', fontSize: 15, padding: '12px 0' }}>
-              Got it
-            </button>
-          </div>
-        </div>
-      )}
+  if (info.activeOwner) {
+    return banner('#f59e0b', <>This plate is <strong>currently registered</strong> to {info.activeOwner}.</>);
+  }
+  return banner(theme.accent, <>
+    <strong>Returning vehicle</strong> — this car has been with us before
+    {info.previousOwner ? <> (previously {info.previousOwner})</> : null}
+    {info.serviceCount ? <>, {info.serviceCount} service{info.serviceCount !== 1 ? 's' : ''} on record</> : null}
+    {info.lastServiceDate ? <>, last {formatDate(info.lastServiceDate)}</> : null}.
+    {' '}Its full service history will carry over automatically.
+  </>);
+}
 
-      {/* Persistent inline reminder under the input */}
-      {info && (info.activeOwner
-        ? banner('#f59e0b', <>This plate is <strong>currently registered</strong> to {info.activeOwner}.</>)
-        : banner(theme.accent, <>
-            <strong>Returning vehicle</strong> — this car has been with us before
-            {info.previousOwner ? <> (previously {info.previousOwner})</> : null}
-            {info.serviceCount ? <>, {info.serviceCount} service{info.serviceCount !== 1 ? 's' : ''} on record</> : null}
-            {info.lastServiceDate ? <>, last {formatDate(info.lastServiceDate)}</> : null}.
-            {' '}Its full service history will carry over automatically.
-          </>))}
-    </>
+// ── Blocking confirm shown at submit time when the plate is a returning car. ──
+// This gates the actual registration: nothing is saved until the technician
+// clicks through it, so the alert can never be skipped past.
+function ReturningVehicleConfirm({ info, confirmLabel, onConfirm, onCancel, theme }) {
+  if (!info) return null;
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999, padding: 20 }}>
+      <div style={{ background: theme.card, border: `2px solid ${theme.accent}`, borderRadius: 14, padding: '30px 32px', maxWidth: 440, width: '100%', fontFamily: "'JetBrains Mono', monospace", textAlign: 'center', boxShadow: `0 0 0 4px ${theme.accent}22` }}>
+        <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 4, textTransform: 'uppercase', marginBottom: 10 }}>Returning Vehicle</div>
+        <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 800, fontSize: 30, letterSpacing: 1, color: theme.text, marginBottom: 6 }}>{info.plate}</div>
+        <p style={{ color: theme.textDim, fontSize: 13.5, lineHeight: 1.7, margin: '0 0 22px' }}>
+          We've serviced this car before{info.previousOwner ? <> — it was previously <strong style={{ color: theme.text }}>{info.previousOwner}</strong>'s</> : null}.
+          {info.serviceCount ? <> There {info.serviceCount === 1 ? 'is' : 'are'} <strong style={{ color: theme.text }}>{info.serviceCount}</strong> past service{info.serviceCount !== 1 ? 's' : ''} on record{info.lastServiceDate ? <> (last {formatDate(info.lastServiceDate)})</> : null}.</> : null}
+          {' '}Its full history will carry over to the new owner automatically.
+        </p>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button type="button" onClick={onCancel} style={{ ...btnStyle('#374151', '#fff'), flex: 1 }}>Cancel</button>
+          <button type="button" autoFocus onClick={onConfirm} style={{ ...btnStyle(theme.accent, theme.bg), flex: 2 }}>{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1441,6 +1453,7 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
   const [registering, setRegistering] = useState(false);
+  const [returningInfo, setReturningInfo] = useState(null); // returning-vehicle confirm gate
   const [connected, setConnected] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [showChangePassword, setShowChangePassword] = useState(false);
@@ -1511,9 +1524,7 @@ export default function App() {
     };
   }, [fetchMembers, authed]);
 
-  const handleAddMember = async (e) => {
-    e.preventDefault();
-    if (!newName.trim()) return;
+  const doRegister = async () => {
     setRegistering(true);
     try {
       await apiFetch('/api/new-member', {
@@ -1522,11 +1533,29 @@ export default function App() {
       });
       toast(`${newName.trim()} registered!`);
       setNewName(''); setNewPlate(''); setNewModel('');
+      setReturningInfo(null);
     } catch (err) {
       toast(`Registration failed: ${err.message}`, 'error');
     } finally {
       setRegistering(false);
     }
+  };
+
+  const handleAddMember = async (e) => {
+    e.preventDefault();
+    if (!newName.trim()) return;
+    const plate = newPlate.trim().toUpperCase();
+    // Gate on returning vehicles: block the save and make the tech confirm first.
+    if (plate.length >= 3) {
+      setRegistering(true);
+      const pre = await apiFetch(`/api/plate-precheck/${encodeURIComponent(plate)}`).catch(() => null);
+      setRegistering(false);
+      if (pre && pre.known && !pre.activeOwner) {
+        setReturningInfo(pre); // show blocking confirm; doRegister() runs on confirm
+        return;
+      }
+    }
+    doRegister();
   };
 
   const handleUpdatePoints = async (id, carId = null) => {
@@ -1703,6 +1732,13 @@ export default function App() {
             </button>
             <PlateNotice plate={newPlate} theme={theme} />
           </form>
+          <ReturningVehicleConfirm
+            info={returningInfo}
+            confirmLabel="Register anyway"
+            onConfirm={doRegister}
+            onCancel={() => setReturningInfo(null)}
+            theme={theme}
+          />
         </div>
         )}
 
