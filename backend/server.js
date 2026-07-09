@@ -1012,6 +1012,56 @@ app.get('/api/transactions/:memberId', async (req, res) => {
   }
 });
 
+// ── Plate precheck (for the registration form) ──
+// Tells staff, as they type a plate, whether this physical car has been with
+// us before — so a "new" customer's car that we've serviced under a previous
+// owner is flagged, and its history carries over. Fails quiet so a lookup
+// hiccup never blocks registration.
+app.get('/api/plate-precheck/:plate', async (req, res) => {
+  const plate = (req.params.plate || '').trim().toUpperCase();
+  if (!plate) return res.json({ known: false });
+  try {
+    const v = await pool.query('SELECT vehicle_id, car_model FROM vehicles WHERE UPPER(plate) = $1', [plate]);
+    if (v.rows.length === 0) return res.json({ known: false, plate });
+    const vehicleId = v.rows[0].vehicle_id;
+
+    // Is it currently owned by an active member? (would be a duplicate)
+    const active = await pool.query(
+      `SELECT m.full_name
+         FROM cars c
+         JOIN members m ON m.member_id = c.member_id AND m.deleted_at IS NULL
+        WHERE c.vehicle_id = $1
+        ORDER BY c.car_id DESC LIMIT 1`,
+      [vehicleId]
+    );
+
+    // Service history summary + most recent known owner (snapshot survives purges).
+    const hist = await pool.query(
+      `SELECT COUNT(*)::int AS cnt,
+              MAX(transaction_date) AS last_date,
+              (SELECT served_member_name FROM point_transactions
+                WHERE vehicle_id = $1 AND served_member_name IS NOT NULL
+                ORDER BY transaction_date DESC LIMIT 1) AS last_owner
+         FROM point_transactions WHERE vehicle_id = $1`,
+      [vehicleId]
+    );
+    const row = hist.rows[0] || {};
+
+    res.json({
+      known: true,
+      plate,
+      carModel: v.rows[0].car_model || null,
+      serviceCount: row.cnt || 0,
+      lastServiceDate: row.last_date || null,
+      previousOwner: row.last_owner || null,
+      activeOwner: active.rows[0]?.full_name || null,
+    });
+  } catch (err) {
+    console.error('GET /api/plate-precheck error:', err.message);
+    res.json({ known: false }); // never block the form on a lookup error
+  }
+});
+
 // ── Car service history by plate ──
 // The whole point of the vehicles table: search a physical plate and see
 // every service ever done on it, across all owners and years, even if the

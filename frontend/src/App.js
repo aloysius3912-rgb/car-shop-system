@@ -580,6 +580,7 @@ function CarsPanel({ member, theme, onCarAdded, onCarDeleted }) {
               <button type="submit" disabled={adding} style={{ ...btnStyle(theme.accent, theme.bg), opacity: adding ? 0.6 : 1 }}>
                 {adding ? 'Adding…' : 'Add'}
               </button>
+              <PlateNotice plate={newPlate} theme={theme} />
               <button type="button" onClick={() => { setShowAddForm(false); setNewPlate(''); setNewModel(''); }}
                 style={btnStyle('#374151', '#fff')}>Cancel</button>
             </form>
@@ -1234,6 +1235,52 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTele
   );
 }
 
+// ── Live "we know this car" banner shown under a plate input as staff type ──
+// Debounced lookup against /api/plate-precheck. Silent unless the plate is a
+// returning vehicle (or a current duplicate).
+function PlateNotice({ plate, theme }) {
+  const [info, setInfo] = useState(null);
+
+  useEffect(() => {
+    const p = (plate || '').trim().toUpperCase();
+    if (p.length < 3) { setInfo(null); return; }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const data = await apiFetch(`/api/plate-precheck/${encodeURIComponent(p)}`);
+        if (!cancelled) setInfo(data && data.known ? data : null);
+      } catch {
+        if (!cancelled) setInfo(null);
+      }
+    }, 400);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [plate]);
+
+  if (!info) return null;
+
+  const banner = (color, children) => (
+    <div style={{
+      flexBasis: '100%', background: `${color}14`, border: `1px solid ${color}44`,
+      borderRadius: 8, padding: '10px 14px', fontSize: 12.5, lineHeight: 1.6,
+      color: theme.text, fontFamily: "'JetBrains Mono', monospace",
+    }}>{children}</div>
+  );
+
+  // Currently owned by someone active → it's a duplicate, not a returning car.
+  if (info.activeOwner) {
+    return banner('#f59e0b', <>This plate is <strong>currently registered</strong> to {info.activeOwner}.</>);
+  }
+
+  // Known vehicle, not currently owned → returning car.
+  return banner(theme.accent, <>
+    <strong>Returning vehicle</strong> — this car has been with us before
+    {info.previousOwner ? <> (previously {info.previousOwner})</> : null}
+    {info.serviceCount ? <>, {info.serviceCount} service{info.serviceCount !== 1 ? 's' : ''} on record</> : null}
+    {info.lastServiceDate ? <>, last {formatDate(info.lastServiceDate)}</> : null}.
+    {' '}Its full service history will carry over automatically.
+  </>);
+}
+
 // ── Plate lookup: full service history of a physical car, across all owners ──
 // Consumes GET /api/car-history/:plate — a flat array of services (newest
 // first), each: transaction_date, description, points_added, staff_name,
@@ -1621,6 +1668,7 @@ export default function App() {
               {registering ? <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} /> : '＋'}
               {registering ? 'Saving…' : 'Register'}
             </button>
+            <PlateNotice plate={newPlate} theme={theme} />
           </form>
         </div>
         )}
