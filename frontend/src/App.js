@@ -1239,9 +1239,9 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTele
 // Debounced lookup against /api/plate-precheck. Silent unless the plate is a
 // returning vehicle (or a current duplicate).
 function PlateNotice({ plate, theme }) {
-  const [info, setInfo] = useState(null);
-  const [modalOpen, setModalOpen] = useState(false);
-  const [ackPlate, setAckPlate] = useState(''); // plate we've already shown the modal for
+  const [info, setInfo] = useState(null);   // live, drives the inline banner
+  const [alert, setAlert] = useState(null); // frozen snapshot for the modal; null = closed
+  const [ackPlate, setAckPlate] = useState(''); // plate we've already alerted for
 
   useEffect(() => {
     const p = (plate || '').trim().toUpperCase();
@@ -1253,9 +1253,10 @@ function PlateNotice({ plate, theme }) {
         if (cancelled) return;
         if (data && data.known) {
           setInfo(data);
-          // Returning vehicle (known, not currently owned) → pop the modal once
-          // per plate so a busy technician can't miss it.
-          if (!data.activeOwner && p !== ackPlate) setModalOpen(true);
+          // Returning vehicle (known, not currently owned): freeze a snapshot
+          // and open the modal once per plate. Using a separate frozen state
+          // means later re-fetches/re-renders can't close it — only "Got it" can.
+          if (!data.activeOwner && p !== ackPlate) setAlert(data);
         } else {
           setInfo(null);
         }
@@ -1268,7 +1269,7 @@ function PlateNotice({ plate, theme }) {
 
   const acknowledge = () => {
     setAckPlate((plate || '').trim().toUpperCase());
-    setModalOpen(false);
+    setAlert(null);
   };
 
   const banner = (color, children) => (
@@ -1281,18 +1282,18 @@ function PlateNotice({ plate, theme }) {
 
   return (
     <>
-      {/* Unmissable acknowledgment modal for returning vehicles */}
-      {modalOpen && info && !info.activeOwner && (
+      {/* Unmissable acknowledgment modal — stays until "Got it" is clicked. */}
+      {alert && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999, padding: 20 }}>
           <div style={{ background: theme.card, border: `2px solid ${theme.accent}`, borderRadius: 14, padding: '30px 32px', maxWidth: 440, width: '100%', fontFamily: "'JetBrains Mono', monospace", textAlign: 'center', boxShadow: `0 0 0 4px ${theme.accent}22` }}>
             <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 4, textTransform: 'uppercase', marginBottom: 10 }}>Returning Vehicle</div>
-            <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 800, fontSize: 30, letterSpacing: 1, color: theme.text, marginBottom: 6 }}>{info.plate}</div>
+            <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 800, fontSize: 30, letterSpacing: 1, color: theme.text, marginBottom: 6 }}>{alert.plate}</div>
             <p style={{ color: theme.textDim, fontSize: 13.5, lineHeight: 1.7, margin: '0 0 20px' }}>
-              We've serviced this car before{info.previousOwner ? <> — it was previously <strong style={{ color: theme.text }}>{info.previousOwner}</strong>'s</> : null}.
-              {info.serviceCount ? <> There {info.serviceCount === 1 ? 'is' : 'are'} <strong style={{ color: theme.text }}>{info.serviceCount}</strong> past service{info.serviceCount !== 1 ? 's' : ''} on record{info.lastServiceDate ? <> (last {formatDate(info.lastServiceDate)})</> : null}.</> : null}
+              We've serviced this car before{alert.previousOwner ? <> — it was previously <strong style={{ color: theme.text }}>{alert.previousOwner}</strong>'s</> : null}.
+              {alert.serviceCount ? <> There {alert.serviceCount === 1 ? 'is' : 'are'} <strong style={{ color: theme.text }}>{alert.serviceCount}</strong> past service{alert.serviceCount !== 1 ? 's' : ''} on record{alert.lastServiceDate ? <> (last {formatDate(alert.lastServiceDate)})</> : null}.</> : null}
               {' '}Its full history will carry over to the new owner automatically.
             </p>
-            <button onClick={acknowledge} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', fontSize: 15, padding: '12px 0' }}>
+            <button type="button" autoFocus onClick={acknowledge} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', fontSize: 15, padding: '12px 0' }}>
               Got it
             </button>
           </div>
