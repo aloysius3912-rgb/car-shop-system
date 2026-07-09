@@ -390,6 +390,7 @@ function PointsPanel({ memberId, theme, cars = [], pointsValue, descriptionValue
   const [selectedServices, setSelectedServices] = useState([]); // earn: multi-select
   // Auto-select the only car; otherwise start unselected (staff must pick).
   const [selectedCarId, setSelectedCarId] = useState(cars.length === 1 ? cars[0].car_id : null);
+  const [applying, setApplying] = useState(false); // in-flight guard against double-submit
   const isRedeem = tab === 'redeem';
   const tabAccent = isRedeem ? '#ef4444' : theme.accent;
 
@@ -418,13 +419,19 @@ function PointsPanel({ memberId, theme, cars = [], pointsValue, descriptionValue
     onDescriptionChange('');
   };
 
-  const handleApply = () => {
+  const handleApply = async () => {
+    if (applying) return; // ignore rapid second clicks / double-taps
     // Earning requires a car if the member has any cars registered.
     if (!isRedeem && cars.length > 0 && !selectedCarId) {
       toast('Select which car this service was for.', 'warn');
       return;
     }
-    onApply(isRedeem ? null : selectedCarId);
+    setApplying(true);
+    try {
+      await onApply(isRedeem ? null : selectedCarId);
+    } finally {
+      setApplying(false);
+    }
   };
 
   return (
@@ -526,8 +533,8 @@ function PointsPanel({ memberId, theme, cars = [], pointsValue, descriptionValue
           value={pointsValue} onChange={e => onPointsChange(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && handleApply()}
           style={inputStyle(theme, { width: 130, textAlign: 'center', color: isRedeem && pointsValue && parseInt(pointsValue) < 0 ? '#ef4444' : theme.text })} />
-        <button onClick={handleApply} style={btnStyle(isRedeem ? '#ef4444' : theme.accent, isRedeem ? '#fff' : theme.bg)}>
-          {isRedeem ? 'Redeem' : 'Apply'}
+        <button onClick={handleApply} disabled={applying} style={{ ...btnStyle(isRedeem ? '#ef4444' : theme.accent, isRedeem ? '#fff' : theme.bg), opacity: applying ? 0.6 : 1, cursor: applying ? 'default' : 'pointer' }}>
+          {applying ? (isRedeem ? 'Redeeming…' : 'Applying…') : (isRedeem ? 'Redeem' : 'Apply')}
         </button>
       </div>
       {isRedeem && <p style={{ marginTop: 10, fontSize: 11, color: theme.textFaint }}>Tap a preset or enter a negative number (e.g. -100) to deduct.</p>}
@@ -1849,7 +1856,7 @@ export default function App() {
 
                       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 8 }}>
                         {cars[0]?.car_model && <span style={{ fontSize: 12, color: theme.textDim }}>{cars[0].car_model}</span>}
-                        <span style={{ fontSize: 12, color: theme.textFaint }}>📅 Joined {formatDate(member.date_joined)}</span>
+                        <span style={{ fontSize: 12, color: theme.textFaint }}>Joined {formatDate(member.date_joined)}</span>
                       </div>
 
                       <div style={{ display: 'flex', alignItems: 'baseline', gap: 5 }}>
