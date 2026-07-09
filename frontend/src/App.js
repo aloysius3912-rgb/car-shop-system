@@ -32,13 +32,17 @@ function getInitialTheme() {
 }
 
 // ── Service presets ──
+// Earn-side services are multi-select and carry NO fixed points — upgrades are
+// priced case-by-case, so staff tick everything that was done and key in the
+// total points manually. (Redeem presets below still carry fixed values.)
 const SERVICE_PRESETS = [
-  { label: 'Auto Suction Door', points: 200 },
-  { label: 'LED Install', points: 150 },
-  { label: 'Soundproofing', points: 300 },
-  { label: 'Audio System', points: 400 },
-  { label: '360 Camera', points: 250 },
-  { label: 'Custom', points: '' },
+  'Auto Suction Door',
+  'LED Install',
+  'Soundproofing',
+  'Audio System',
+  '360 Camera',
+  'Ceramic Solar Film',
+  'Tesla Upgrade',
 ];
 
 const REDEEM_PRESETS = [
@@ -382,21 +386,37 @@ function TelegramModal({ onClose, theme }) {
 // ── Points panel with earn/redeem tabs ──
 function PointsPanel({ memberId, theme, cars = [], pointsValue, descriptionValue, onPointsChange, onDescriptionChange, onApply, canAdd = true, canDeduct = true }) {
   const [tab, setTab] = useState(canAdd ? 'earn' : 'redeem');
-  const [selectedPreset, setSelectedPreset] = useState(null);
+  const [selectedPreset, setSelectedPreset] = useState(null);   // redeem: single-select
+  const [selectedServices, setSelectedServices] = useState([]); // earn: multi-select
   // Auto-select the only car; otherwise start unselected (staff must pick).
   const [selectedCarId, setSelectedCarId] = useState(cars.length === 1 ? cars[0].car_id : null);
   const isRedeem = tab === 'redeem';
-  const presets = isRedeem ? REDEEM_PRESETS : SERVICE_PRESETS;
   const tabAccent = isRedeem ? '#ef4444' : theme.accent;
 
+  // Earn: toggle a service on/off and rebuild the description from the picks.
+  const toggleService = (label) => {
+    setSelectedServices(prev => {
+      const next = prev.includes(label) ? prev.filter(l => l !== label) : [...prev, label];
+      onDescriptionChange(next.join(' + '));
+      return next;
+    });
+  };
+
+  // Redeem: single-select preset that sets both description and points.
   const choosePreset = (preset) => {
     setSelectedPreset(preset.label);
-    const isCustom = preset.label === 'Custom' || preset.label === 'Custom Redeem';
+    const isCustom = preset.label === 'Custom Redeem';
     onDescriptionChange(isCustom ? '' : preset.label);
     if (preset.points !== '') onPointsChange(String(preset.points));
   };
 
-  const switchTab = (t) => { setTab(t); setSelectedPreset(null); onPointsChange(''); onDescriptionChange(''); };
+  const switchTab = (t) => {
+    setTab(t);
+    setSelectedPreset(null);
+    setSelectedServices([]);
+    onPointsChange('');
+    onDescriptionChange('');
+  };
 
   const handleApply = () => {
     // Earning requires a car if the member has any cars registered.
@@ -422,27 +442,58 @@ function PointsPanel({ memberId, theme, cars = [], pointsValue, descriptionValue
       </div>
 
       <div style={{ fontSize: 11, color: tabAccent, letterSpacing: 2, marginBottom: 10, textTransform: 'uppercase' }}>
-        {isRedeem ? 'Redeem Presets' : 'Quick-Tap Service'}
+        {isRedeem ? 'Redeem Presets' : 'Services Performed — select all that apply'}
       </div>
 
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
-        {presets.map(preset => {
-          const isActive = selectedPreset === preset.label;
-          return (
-            <button key={preset.label} onClick={() => choosePreset(preset)} style={{
-              padding: '8px 14px', borderRadius: 8, fontSize: 13,
-              fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
-              cursor: 'pointer', whiteSpace: 'nowrap',
-              border: `1px solid ${isActive ? tabAccent : theme.border}`,
-              background: isActive ? `${tabAccent}18` : theme.inputBg,
-              color: isActive ? tabAccent : theme.textDim,
-              transition: 'all 0.15s ease',
-            }}>
-              {preset.label}{preset.points !== '' ? ` · ${preset.points}` : ''}
-            </button>
-          );
-        })}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: isRedeem ? 14 : 8 }}>
+        {isRedeem
+          ? REDEEM_PRESETS.map(preset => {
+              const isActive = selectedPreset === preset.label;
+              return (
+                <button key={preset.label} onClick={() => choosePreset(preset)} style={{
+                  padding: '8px 14px', borderRadius: 8, fontSize: 13,
+                  fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
+                  cursor: 'pointer', whiteSpace: 'nowrap',
+                  border: `1px solid ${isActive ? tabAccent : theme.border}`,
+                  background: isActive ? `${tabAccent}18` : theme.inputBg,
+                  color: isActive ? tabAccent : theme.textDim,
+                  transition: 'all 0.15s ease',
+                }}>
+                  {preset.label}{preset.points !== '' ? ` · ${preset.points}` : ''}
+                </button>
+              );
+            })
+          : SERVICE_PRESETS.map(label => {
+              const isActive = selectedServices.includes(label);
+              return (
+                <button key={label} onClick={() => toggleService(label)} style={{
+                  padding: '8px 14px', borderRadius: 8, fontSize: 13,
+                  fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
+                  cursor: 'pointer', whiteSpace: 'nowrap',
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  border: `1px solid ${isActive ? tabAccent : theme.border}`,
+                  background: isActive ? `${tabAccent}18` : theme.inputBg,
+                  color: isActive ? tabAccent : theme.textDim,
+                  transition: 'all 0.15s ease',
+                }}>
+                  <span style={{
+                    width: 15, height: 15, borderRadius: 4, flexShrink: 0,
+                    border: `1.5px solid ${isActive ? tabAccent : theme.textFaint}`,
+                    background: isActive ? tabAccent : 'transparent',
+                    color: theme.bg, fontSize: 11, fontWeight: 800,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', lineHeight: 1,
+                  }}>{isActive ? '✓' : ''}</span>
+                  {label}
+                </button>
+              );
+            })}
       </div>
+
+      {!isRedeem && (
+        <p style={{ margin: '0 0 14px', fontSize: 11, color: theme.textFaint, lineHeight: 1.5 }}>
+          Tick every upgrade done this visit, then enter the total points for the job. You can also edit the description directly.
+        </p>
+      )}
 
       {/* Car selector — only when earning and the member has more than one car */}
       {!isRedeem && cars.length > 1 && (
@@ -468,8 +519,8 @@ function PointsPanel({ memberId, theme, cars = [], pointsValue, descriptionValue
       )}
 
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-        <input type="text" placeholder={isRedeem ? 'Redemption description…' : 'Description (e.g. LED Install)'}
-          value={descriptionValue} onChange={e => { onDescriptionChange(e.target.value); setSelectedPreset(null); }}
+        <input type="text" placeholder={isRedeem ? 'Redemption description…' : 'Description (auto-fills from ticks)'}
+          value={descriptionValue} onChange={e => { onDescriptionChange(e.target.value); setSelectedPreset(null); setSelectedServices([]); }}
           style={inputStyle(theme, { flex: '2 1 180px' })} />
         <input type="number" placeholder={isRedeem ? 'Points to deduct' : 'Points to add'}
           value={pointsValue} onChange={e => onPointsChange(e.target.value)}
@@ -479,7 +530,7 @@ function PointsPanel({ memberId, theme, cars = [], pointsValue, descriptionValue
           {isRedeem ? 'Redeem' : 'Apply'}
         </button>
       </div>
-      {isRedeem && <p style={{ marginTop: 10, fontSize: 11, color: theme.textFaint }}>💡 Tap a preset or enter a negative number (e.g. -100) to deduct.</p>}
+      {isRedeem && <p style={{ marginTop: 10, fontSize: 11, color: theme.textFaint }}>Tap a preset or enter a negative number (e.g. -100) to deduct.</p>}
     </div>
   );
 }
