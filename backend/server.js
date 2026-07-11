@@ -216,6 +216,126 @@ async function sendTelegram(chatId, text) {
   }
 }
 
+// ── Customer-facing bot ──
+const SHOP_NAME = 'Dats Auto';
+// Voucher tiers in points (mirror the redeem presets in the app).
+const REWARD_TIERS = [
+  { points: 50, label: '$5 voucher' },
+  { points: 100, label: '$10 voucher' },
+  { points: 200, label: '$20 voucher' },
+  { points: 500, label: '$50 voucher' },
+];
+
+function rewardProgress(balance) {
+  const next = REWARD_TIERS.find(t => t.points > balance);
+  if (next) return `You are ${next.points - balance} points away from a ${next.label}.`;
+  return `You have enough to redeem our top ${REWARD_TIERS[REWARD_TIERS.length - 1].label} — come by any time!`;
+}
+
+// Answer a "/points <plate>" query with the current owner's balance + progress.
+async function handlePointsQuery(chatId, plateRaw) {
+  const plate = (plateRaw || '').trim().toUpperCase();
+  if (!plate) {
+    await sendTelegram(chatId, `Please include your car plate, e.g.\n/points SBA1234A`);
+    return;
+  }
+  const r = await pool.query(
+    `SELECT m.full_name, m.total_points
+       FROM cars c
+       JOIN members m ON m.member_id = c.member_id AND m.deleted_at IS NULL
+      WHERE UPPER(c.car_plate) = $1
+      ORDER BY c.car_id DESC LIMIT 1`,
+    [plate]
+  );
+  if (r.rows.length === 0) {
+    await sendTelegram(chatId, `We couldn't find an active membership for plate ${plate}. Please check the plate, or ask our staff to register you at your next visit.`);
+    return;
+  }
+  const { full_name, total_points } = r.rows[0];
+  const bal = Number(total_points) || 0;
+  await sendTelegram(chatId,
+    `Hi ${full_name}! Your car ${plate} has ${bal.toLocaleString()} points available.\n${rewardProgress(bal)}`);
+}
+
+// Process one incoming Telegram update (message).
+async function processTelegramUpdate(update) {
+  const msg = update.message;
+  if (!msg || !msg.text) return;
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
+
+  // 1) Staff 2FA link code — honored regardless of age so linking is reliable.
+  const codeMatch = await pool.query(
+    'SELECT id, username FROM staff_users WHERE telegram_link_code IS NOT NULL AND UPPER(telegram_link_code) = UPPER($1)',
+    [text]
+  );
+  if (codeMatch.rows.length) {
+    const staff = codeMatch.rows[0];
+    await pool.query('UPDATE staff_users SET telegram_chat_id = $1, telegram_link_code = NULL WHERE id = $2', [chatId, staff.id]);
+    await sendTelegram(chatId, `Telegram linked to ${SHOP_NAME} staff account "${staff.username}". You'll now receive a 4-digit PIN on every login.`).catch(() => {});
+    return;
+  }
+
+  // 2) Ignore stale command messages so a cold-started server doesn't reply to
+  //    an old backlog. (Link codes above are exempt.)
+  if (msg.date && (Date.now() / 1000 - msg.date) > 120) return;
+
+  const lower = text.toLowerCase();
+  if (lower === '/start' || lower === '/help') {
+    await sendTelegram(chatId, `Welcome to ${SHOP_NAME}! To check your loyalty points, send:\n\n/points YOURPLATE\n\nExample: /points SBA1234A`);
+    return;
+  }
+  if (lower.startsWith('/points')) {
+    // "/points SBA1234A" or "/points@BotName SBA1234A"
+    const parts = text.split(/\s+/);
+    await handlePointsQuery(chatId, parts[1]);
+    return;
+  }
+
+  // Gentle fallback in private chats only (avoid replying in groups).
+  if (msg.chat.type === 'private') {
+    await sendTelegram(chatId, `Send /points YOURPLATE to check your points — e.g. /points SBA1234A`);
+  }
+}
+
+// ── Single long-polling loop (owns getUpdates for the whole app) ──
+let telegramOffset = 0;
+let telegramPolling = false;
+
+async function pollTelegram() {
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=30${telegramOffset ? `&offset=${telegramOffset}` : ''}`;
+    const res = await fetch(url);
+    if (res.ok) {
+      const data = await res.json();
+      for (const update of (data.result || [])) {
+        telegramOffset = Math.max(telegramOffset, update.update_id + 1);
+        try { await processTelegramUpdate(update); }
+        catch (e) { console.error('Telegram update error:', e.message); }
+      }
+    } else if (res.status === 409) {
+      console.error('Telegram getUpdates 409 (another poller or webhook active) — backing off');
+      await new Promise(r => setTimeout(r, 5000));
+    } else {
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  } catch (e) {
+    console.error('Telegram poll error:', e.message);
+    await new Promise(r => setTimeout(r, 5000));
+  }
+  setTimeout(pollTelegram, 400);
+}
+
+async function startTelegramBot() {
+  if (!TELEGRAM_BOT_TOKEN || telegramPolling) return;
+  telegramPolling = true;
+  // Ensure no webhook is set, otherwise getUpdates returns 409.
+  try { await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook`); } catch {}
+  console.log('Telegram bot polling started.');
+  pollTelegram();
+}
+startTelegramBot();
+
 // ── Role hierarchy ──
 // Master (owners) > Admin (shop manager) > Technician (installers).
 // Rank comparisons drive who may manage whom.
@@ -537,31 +657,17 @@ app.post('/api/telegram/confirm-link', async (req, res) => {
     return res.status(400).json({ error: 'Telegram bot is not configured on the server.' });
   }
   try {
+    // The polling loop links the account automatically as soon as the code
+    // message arrives, so here we just check whether that's happened yet.
     const result = await pool.query(
-      'SELECT telegram_link_code FROM staff_users WHERE id = $1',
+      'SELECT telegram_chat_id, telegram_link_code FROM staff_users WHERE id = $1',
       [req.user.id]
     );
-    const code = result.rows[0]?.telegram_link_code;
-    if (!code) return res.status(400).json({ error: 'No pending link code. Generate one first.' });
-
-    const tgRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=100`);
-    if (!tgRes.ok) throw new Error(`getUpdates ${tgRes.status}`);
-    const data = await tgRes.json();
-
-    // Newest first; match the exact code (case-insensitive, trimmed).
-    const updates = (data.result || []).slice().reverse();
-    const hit = updates.find(u => (u.message?.text || '').trim().toUpperCase() === code.toUpperCase());
-    if (!hit) {
-      return res.status(404).json({ error: `Code not received yet. In Telegram, send ${code} to the bot, then press Confirm again.` });
-    }
-
-    const chatId = hit.message.chat.id;
-    await pool.query(
-      'UPDATE staff_users SET telegram_chat_id = $1, telegram_link_code = NULL WHERE id = $2',
-      [chatId, req.user.id]
-    );
-    await sendTelegram(chatId, `✅ Telegram linked to Car Shop staff account "${req.user.username}". You'll now receive a 4-digit PIN on every login.`).catch(() => {});
-    res.json({ success: true });
+    const row = result.rows[0] || {};
+    if (row.telegram_chat_id) return res.json({ success: true });
+    return res.status(404).json({
+      error: `Not linked yet. In Telegram, send ${row.telegram_link_code || 'your code'} to the bot, then press Confirm again.`,
+    });
   } catch (err) {
     console.error('POST /api/telegram/confirm-link error:', err.message);
     res.status(500).json({ error: 'Could not confirm the link. Please try again.' });
