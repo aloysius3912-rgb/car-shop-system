@@ -232,6 +232,33 @@ function rewardProgress(balance) {
   return `You have enough to redeem our top ${REWARD_TIERS[REWARD_TIERS.length - 1].label} — come by any time!`;
 }
 
+// ── Shop settings (simple key/value; used for Master-controlled toggles) ──
+async function ensureShopSettings() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shop_settings (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
+  await pool.query(
+    `INSERT INTO shop_settings (key, value) VALUES ('admins_receive_eod_reports', 'false')
+     ON CONFLICT (key) DO NOTHING`
+  );
+}
+ensureShopSettings().catch(err => console.error('Shop settings setup failed:', err.message));
+
+async function getSetting(key) {
+  const r = await pool.query('SELECT value FROM shop_settings WHERE key = $1', [key]);
+  return r.rows[0]?.value ?? null;
+}
+async function setSetting(key, value) {
+  await pool.query(
+    `INSERT INTO shop_settings (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [key, String(value)]
+  );
+}
+
 // Answer a "/points <plate>" query with the current owner's balance + progress.
 async function handlePointsQuery(chatId, plateRaw) {
   const plate = (plateRaw || '').trim().toUpperCase();
@@ -257,6 +284,161 @@ async function handlePointsQuery(chatId, plateRaw) {
     `Hi ${full_name}! Your car ${plate} has ${bal.toLocaleString()} points available.\n${rewardProgress(bal)}`);
 }
 
+// ── Staff bot commands (role-gated) ──
+
+// /lookup <plate> — durable service history of a physical car (all staff).
+async function handleLookupCommand(chatId, plateRaw) {
+  const plate = (plateRaw || '').trim().toUpperCase();
+  if (!plate) { await sendTelegram(chatId, 'Usage: /lookup SBA1234A'); return; }
+  const r = await pool.query(
+    `SELECT t.transaction_date, t.description, t.points_added,
+            t.served_member_name, u.username AS staff_name
+       FROM point_transactions t
+       JOIN vehicles v ON v.vehicle_id = t.vehicle_id
+       LEFT JOIN staff_users u ON u.id = t.staff_id
+      WHERE UPPER(v.plate) = $1
+      ORDER BY t.transaction_date DESC
+      LIMIT 15`,
+    [plate]
+  );
+  if (r.rows.length === 0) {
+    await sendTelegram(chatId, `No service history on record for ${plate}.`);
+    return;
+  }
+  const lines = r.rows.map(t => {
+    const d = new Date(t.transaction_date).toLocaleDateString('en-SG', { day: 'numeric', month: 'short', year: 'numeric' });
+    const who = t.served_member_name ? ` — ${t.served_member_name}` : '';
+    const by = t.staff_name ? ` (by ${t.staff_name})` : '';
+    return `• ${d}: ${t.description || 'Service'}${who}${by}`;
+  });
+  await sendTelegram(chatId, `Service history for ${plate} (latest ${r.rows.length}):\n\n${lines.join('\n')}`);
+}
+
+// /customer <name> — profile, balance, cars (Admin and Master only).
+async function handleCustomerCommand(chatId, nameRaw) {
+  const name = (nameRaw || '').trim();
+  if (!name) { await sendTelegram(chatId, 'Usage: /customer David Lim'); return; }
+  const r = await pool.query(
+    `SELECT m.member_id, m.full_name, m.total_points, m.date_joined
+       FROM members m
+      WHERE m.deleted_at IS NULL AND m.full_name ILIKE '%' || $1 || '%'
+      ORDER BY m.full_name ASC
+      LIMIT 5`,
+    [name]
+  );
+  if (r.rows.length === 0) {
+    await sendTelegram(chatId, `No active customer matching "${name}".`);
+    return;
+  }
+  const blocks = [];
+  for (const m of r.rows) {
+    const carsQ = await pool.query(
+      'SELECT car_plate, car_model FROM cars WHERE member_id = $1 ORDER BY car_id ASC',
+      [m.member_id]
+    );
+    const cars = carsQ.rows.length
+      ? carsQ.rows.map(c => `${(c.car_plate || '(no plate)').toUpperCase()}${c.car_model ? ` (${c.car_model})` : ''}`).join(', ')
+      : 'no cars on file';
+    const joined = new Date(m.date_joined).toLocaleDateString('en-SG', { day: 'numeric', month: 'short', year: 'numeric' });
+    blocks.push(`${m.full_name}\nPoints: ${(Number(m.total_points) || 0).toLocaleString()}\nJoined: ${joined}\nCars: ${cars}`);
+  }
+  await sendTelegram(chatId, blocks.join('\n\n———\n\n'));
+}
+
+// /eod — today's numbers in Singapore time (Admin only when toggled; Master always).
+async function handleEodCommand(chatId) {
+  const stats = await pool.query(`
+    WITH today AS (
+      SELECT (NOW() AT TIME ZONE 'Asia/Singapore')::date AS d
+    )
+    SELECT
+      (SELECT COUNT(DISTINCT t.vehicle_id) FROM point_transactions t, today
+        WHERE t.points_added > 0 AND t.vehicle_id IS NOT NULL
+          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS cars_serviced,
+      (SELECT COALESCE(SUM(t.points_added), 0) FROM point_transactions t, today
+        WHERE t.points_added > 0
+          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS points_issued,
+      (SELECT COALESCE(SUM(-t.points_added), 0) FROM point_transactions t, today
+        WHERE t.points_added < 0
+          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS points_redeemed,
+      (SELECT COUNT(*) FROM members m, today
+        WHERE (m.date_joined AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS new_customers
+  `);
+  const s = stats.rows[0];
+  const dateLabel = new Date().toLocaleDateString('en-SG', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'Asia/Singapore' });
+  await sendTelegram(chatId,
+    `End-of-Day Report — ${dateLabel}\n\n` +
+    `Cars serviced: ${s.cars_serviced}\n` +
+    `Points issued: ${s.points_issued.toLocaleString()}\n` +
+    `Points redeemed: ${s.points_redeemed.toLocaleString()}\n` +
+    `New customers: ${s.new_customers}`);
+}
+
+// Route a message from a verified staff member, gated by their exact role.
+async function handleStaffMessage(chatId, staff, text) {
+  const parts = text.trim().split(/\s+/);
+  const cmd = (parts[0] || '').toLowerCase().replace(/@.+$/, ''); // strip @BotName
+  const arg = parts.slice(1).join(' ');
+  const isAdminPlus = staff.role === 'Admin' || staff.role === 'Master';
+  const isMaster = staff.role === 'Master';
+
+  switch (cmd) {
+    case '/lookup':
+      await handleLookupCommand(chatId, arg);
+      return;
+
+    case '/customer':
+      if (!isAdminPlus) {
+        await sendTelegram(chatId, 'You do not have permission to use /customer.');
+        return;
+      }
+      await handleCustomerCommand(chatId, arg);
+      return;
+
+    case '/eod': {
+      if (!isAdminPlus) {
+        await sendTelegram(chatId, 'You do not have permission to use /eod.');
+        return;
+      }
+      if (!isMaster) {
+        const allowed = (await getSetting('admins_receive_eod_reports')) === 'true';
+        if (!allowed) {
+          await sendTelegram(chatId, 'EOD reports for Admins are currently disabled by the Master.');
+          return;
+        }
+      }
+      await handleEodCommand(chatId);
+      return;
+    }
+
+    case '/toggle_reports': {
+      if (!isMaster) {
+        await sendTelegram(chatId, 'Only the Master can use /toggle_reports.');
+        return;
+      }
+      const current = (await getSetting('admins_receive_eod_reports')) === 'true';
+      await setSetting('admins_receive_eod_reports', !current);
+      await sendTelegram(chatId, `Admin EOD reports are now ${!current ? 'ON' : 'OFF'}.`);
+      return;
+    }
+
+    case '/start':
+    case '/help': {
+      const lines = [`Staff commands (${staff.role}):`, '/lookup <plate> — service history of a car'];
+      if (isAdminPlus) {
+        lines.push('/customer <name> — customer profile, points, cars');
+        lines.push('/eod — end-of-day report' + (isMaster ? '' : ' (if enabled by Master)'));
+      }
+      if (isMaster) lines.push('/toggle_reports — enable/disable Admin EOD reports');
+      await sendTelegram(chatId, lines.join('\n'));
+      return;
+    }
+
+    default:
+      await sendTelegram(chatId, `Unrecognised staff command. Send /help to see what you can use.`);
+  }
+}
+
 // Process one incoming Telegram update (message).
 async function processTelegramUpdate(update) {
   const msg = update.message;
@@ -280,6 +462,20 @@ async function processTelegramUpdate(update) {
   //    an old backlog. (Link codes above are exempt.)
   if (msg.date && (Date.now() / 1000 - msg.date) > 120) return;
 
+  // 3) THE BOUNCER — is this chat_id a currently-linked staff member?
+  //    Looked up fresh on EVERY message: the moment a staff account is deleted
+  //    or unlinked (telegram_chat_id = NULL), this stops matching and the
+  //    sender instantly falls through to customer routing below.
+  const staffQ = await pool.query(
+    'SELECT id, username, role FROM staff_users WHERE telegram_chat_id = $1',
+    [chatId]
+  );
+  if (staffQ.rows.length) {
+    await handleStaffMessage(chatId, staffQ.rows[0], text);
+    return;
+  }
+
+  // 4) Customer routing.
   const lower = text.toLowerCase();
   if (lower === '/start' || lower === '/help') {
     await sendTelegram(chatId, `Welcome to ${SHOP_NAME}! To check your loyalty points, send:\n\n/points YOURPLATE\n\nExample: /points SBA1234A`);
@@ -537,6 +733,24 @@ app.post('/api/login/verify-2fa', loginRateLimiter, async (req, res) => {
   } catch (err) {
     console.error('POST /api/login/verify-2fa error:', err.message);
     res.status(500).json({ error: 'Could not verify PIN. Please try again.' });
+  }
+});
+
+// ── Telegram webhook (public: Telegram's servers call this) ──
+// Feeds the SAME router as the polling loop. NOT active unless you register
+// it with Telegram via setWebhook — and note that setting a webhook DISABLES
+// getUpdates polling, so only switch deliberately:
+//   https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://car-shop-system.onrender.com/api/telegram-webhook
+// (To go back to polling: deleteWebhook — the server also does this on boot.)
+app.post('/api/telegram-webhook', async (req, res) => {
+  // Always 200 quickly; Telegram retries non-200s aggressively.
+  res.sendStatus(200);
+  try {
+    if (req.body && (req.body.update_id !== undefined)) {
+      await processTelegramUpdate(req.body);
+    }
+  } catch (err) {
+    console.error('POST /api/telegram-webhook error:', err.message);
   }
 });
 
