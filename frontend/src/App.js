@@ -1430,7 +1430,7 @@ function QuarantineReview({ memberId, theme, onResolved }) {
       const data = await apiFetch(`/api/transactions/${txId}/${action}`, { method: 'POST' });
       toast(action === 'approve'
         ? `Transaction #${txId} approved — points stand.`
-        : `Transaction #${txId} rejected — points reversed.`, action === 'approve' ? 'success' : 'warn');
+        : `Transaction #${txId} rejected — points reversed.${data.disabledStaff ? ` Staff "${data.disabledStaff}" has been disabled pending your review.` : ''}`, action === 'approve' ? 'success' : 'warn');
       if (data.unfrozen) onResolved();
       else load();
     } catch (err) {

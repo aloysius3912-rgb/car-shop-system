@@ -1559,14 +1559,14 @@ app.post('/api/transactions/:txId/reject', requireMaster, async (req, res) => {
     const txQ = await client.query(
       `UPDATE point_transactions SET quarantine_status = 'rejected'
         WHERE transaction_id = $1 AND quarantine_status = 'pending'
-        RETURNING member_id, points_added, description`,
+        RETURNING member_id, points_added, description, staff_id`,
       [txId]
     );
     if (txQ.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'No pending transaction with that ID.' });
     }
-    const { member_id: memberId, points_added: pts } = txQ.rows[0];
+    const { member_id: memberId, points_added: pts, staff_id: offenderId } = txQ.rows[0];
 
     // Reverse the points (floor at zero in case some were already redeemed —
     // shouldn't happen while frozen, but belt-and-braces).
@@ -1585,6 +1585,24 @@ app.post('/api/transactions/:txId/reject', requireMaster, async (req, res) => {
       [memberId, -pts, `Rejected quarantined transaction #${txId}`, req.user.id, upd.rows[0]?.full_name || null]
     );
 
+    // A rejection means the Master judged this transaction illegitimate — so
+    // the account that posted it is suspect. Lock it (and boot its sessions)
+    // until a Master re-enables it after speaking with the staff member.
+    // Never auto-disable a Master, and skip if the poster no longer exists.
+    let disabledStaff = null;
+    if (offenderId) {
+      const offQ = await client.query(
+        `UPDATE staff_users SET is_disabled = true
+          WHERE id = $1 AND role <> 'Master' AND is_disabled = false
+          RETURNING username`,
+        [offenderId]
+      );
+      if (offQ.rows.length) {
+        await client.query('DELETE FROM sessions WHERE staff_id = $1', [offenderId]);
+        disabledStaff = offQ.rows[0].username;
+      }
+    }
+
     const pending = await client.query(
       `SELECT 1 FROM point_transactions WHERE member_id = $1 AND quarantine_status = 'pending' LIMIT 1`,
       [memberId]
@@ -1598,8 +1616,25 @@ app.post('/api/transactions/:txId/reject', requireMaster, async (req, res) => {
     const newTotal = upd.rows[0]?.total_points ?? 0;
     io.emit('pointsUpdated', { memberId, newTotal });
     if (unfrozen) io.emit('memberUnfrozen', { memberId });
-    console.log(`Quarantine: tx #${txId} REJECTED by ${req.user.username}; ${pts} pts reversed.`);
-    res.json({ success: true, newTotal, unfrozen });
+
+    // Tell all Masters the account was locked pending a conversation.
+    if (disabledStaff) {
+      pool.query(
+        `SELECT telegram_chat_id FROM staff_users WHERE role = 'Master' AND telegram_chat_id IS NOT NULL`
+      ).then(masters => {
+        const note =
+          `Quarantine follow-up\n\n` +
+          `Master "${req.user.username}" REJECTED transaction #${txId} (${pts.toLocaleString()} pts reversed).\n\n` +
+          `The staff account "${disabledStaff}" that posted it has been DISABLED and logged out. ` +
+          `Speak with them, then re-enable the account from Manage Staff if appropriate.`;
+        for (const m of masters.rows) {
+          sendTelegram(m.telegram_chat_id, note).catch(e => console.error('Reject notice send failed:', e.message));
+        }
+      }).catch(e => console.error('Reject notice lookup failed:', e.message));
+    }
+
+    console.log(`Quarantine: tx #${txId} REJECTED by ${req.user.username}; ${pts} pts reversed${disabledStaff ? `; staff "${disabledStaff}" disabled` : ''}.`);
+    res.json({ success: true, newTotal, unfrozen, disabledStaff });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('POST /api/transactions/:txId/reject error:', err.message);
