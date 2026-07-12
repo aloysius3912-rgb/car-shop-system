@@ -716,6 +716,12 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme }) {
                     {tx.car_plate && (
                       <span style={{ color: '#f59e0b', fontSize: 12 }}> · {tx.car_plate.toUpperCase()}{tx.car_model ? ` (${tx.car_model})` : ''}</span>
                     )}
+                    {tx.quarantine_status === 'pending' && (
+                      <span style={{ color: '#ef4444', fontSize: 10, fontWeight: 700, letterSpacing: 1, marginLeft: 8, border: '1px solid #ef444466', borderRadius: 5, padding: '1px 6px' }}>PENDING REVIEW</span>
+                    )}
+                    {tx.quarantine_status === 'rejected' && (
+                      <span style={{ color: theme.textFaint, fontSize: 10, fontWeight: 700, letterSpacing: 1, marginLeft: 8, border: `1px solid ${theme.border}`, borderRadius: 5, padding: '1px 6px' }}>REJECTED</span>
+                    )}
                   </span>
                   <span style={{ color: theme.textFaint, fontSize: 11 }}>
                     {formatDateTime(tx.transaction_date)}{tx.staff_name ? ` · by ${tx.staff_name}` : ''}
@@ -1402,6 +1408,76 @@ function ReturningVehicleConfirm({ info, confirmLabel, onConfirm, onCancel, them
   );
 }
 
+// ── Master review panel for a frozen member's pending transactions ──
+function QuarantineReview({ memberId, theme, onResolved }) {
+  const [pending, setPending] = useState(null); // null = loading
+  const [busyId, setBusyId] = useState(null);
+
+  const load = async () => {
+    try {
+      const data = await apiFetch(`/api/members/${memberId}/quarantine`);
+      setPending(Array.isArray(data) ? data : []);
+    } catch {
+      setPending([]);
+    }
+  };
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, [memberId]);
+
+  const act = async (txId, action) => {
+    if (busyId) return;
+    setBusyId(txId);
+    try {
+      const data = await apiFetch(`/api/transactions/${txId}/${action}`, { method: 'POST' });
+      toast(action === 'approve'
+        ? `Transaction #${txId} approved — points stand.`
+        : `Transaction #${txId} rejected — points reversed.`, action === 'approve' ? 'success' : 'warn');
+      if (data.unfrozen) onResolved();
+      else load();
+    } catch (err) {
+      toast(`${action === 'approve' ? 'Approve' : 'Reject'} failed: ${err.message}`, 'error');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  if (pending === null) {
+    return <div style={{ marginTop: 12, fontSize: 12, color: theme.textFaint }}>Loading pending transactions…</div>;
+  }
+  if (pending.length === 0) {
+    return <div style={{ marginTop: 12, fontSize: 12, color: theme.textFaint }}>No pending transactions — use Unfreeze to release the account.</div>;
+  }
+
+  return (
+    <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid #ef444444` }}>
+      <div style={{ fontSize: 11, color: '#ef4444', letterSpacing: 2, textTransform: 'uppercase', marginBottom: 10 }}>
+        Pending Master Review
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {pending.map(tx => (
+          <div key={tx.transaction_id} style={{ background: theme.inputBg, border: '1px solid #ef444444', borderRadius: 8, padding: '10px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 13, color: theme.text, fontWeight: 600 }}>
+                #{tx.transaction_id} · {tx.description || 'Service'} · <span style={{ color: theme.accent }}>+{tx.points_added} pts</span>
+              </div>
+              <div style={{ fontSize: 11, color: theme.textFaint, marginTop: 3 }}>
+                {formatDateTime(tx.transaction_date)}{tx.staff_name ? ` · by ${tx.staff_name}` : ''}
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button disabled={busyId !== null} onClick={() => act(tx.transaction_id, 'approve')} style={{ ...btnStyle('#10b981', '#fff', { padding: '7px 14px' }), opacity: busyId ? 0.6 : 1 }}>
+                {busyId === tx.transaction_id ? 'Working…' : 'Approve'}
+              </button>
+              <button disabled={busyId !== null} onClick={() => act(tx.transaction_id, 'reject')} style={{ ...btnStyle('#ef4444', '#fff', { padding: '7px 14px' }), opacity: busyId ? 0.6 : 1 }}>
+                Reject
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ── Plate lookup: full service history of a physical car, across all owners ──
 // Consumes GET /api/car-history/:plate — a flat array of services (newest
 // first), each: transaction_date, description, points_added, staff_name,
@@ -1581,6 +1657,9 @@ export default function App() {
     socket.on('memberFrozen', ({ memberId }) => {
       setMembers(prev => prev.map(m => m.member_id == memberId ? { ...m, is_frozen: true } : m));
     });
+    socket.on('memberUnfrozen', ({ memberId }) => {
+      setMembers(prev => prev.map(m => m.member_id == memberId ? { ...m, is_frozen: false } : m));
+    });
     socket.on('memberDeleted', ({ memberId }) => setMembers(prev => prev.filter(m => m.member_id != memberId)));
     socket.on('carAdded', ({ memberId, car }) => {
       setMembers(prev => prev.map(m => m.member_id === memberId ? { ...m, cars: [...(m.cars || []), car] } : m));
@@ -1597,7 +1676,7 @@ export default function App() {
     return () => {
       socket.off('connect'); socket.off('disconnect'); socket.off('connect_error');
       socket.off('pointsUpdated');
-      socket.off('memberAdded'); socket.off('memberDeleted'); socket.off('memberFrozen');
+      socket.off('memberAdded'); socket.off('memberDeleted'); socket.off('memberFrozen'); socket.off('memberUnfrozen');
       socket.off('carAdded'); socket.off('carDeleted'); socket.off('transactionAdded');
       socket.disconnect();
     };
@@ -1930,6 +2009,15 @@ export default function App() {
                       )}
                     </div>
                   </div>
+
+                  {/* Quarantine review — Master decides on pending transactions */}
+                  {isMaster && member.is_frozen && (
+                    <QuarantineReview
+                      memberId={member.member_id}
+                      theme={theme}
+                      onResolved={() => setMembers(prev => prev.map(m => m.member_id === member.member_id ? { ...m, is_frozen: false } : m))}
+                    />
+                  )}
 
                   {/* Points panel */}
                   {openPointsPanel === member.member_id && (

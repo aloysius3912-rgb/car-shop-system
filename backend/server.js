@@ -125,6 +125,8 @@ async function ensureVehicleModel() {
   // Fraud interceptor: a staff account that trips the interceptor is disabled
   // (can't log in or make requests) until a Master re-enables it.
   await pool.query(`ALTER TABLE staff_users ADD COLUMN IF NOT EXISTS is_disabled BOOLEAN DEFAULT false;`);
+  // Quarantine review: 'pending' until a Master approves/rejects; NULL = normal tx.
+  await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS quarantine_status TEXT;`);
 
   // Backfill vehicles from every plate we already have on file.
   await pool.query(`
@@ -1487,6 +1489,126 @@ app.post('/api/staff/:id/enable', requireMaster, async (req, res) => {
   }
 });
 
+// ── Quarantine review (Master): approve keeps the points, reject reverses ──
+// them. Both unfreeze the member if no other pending transactions remain.
+
+app.get('/api/members/:id/quarantine', requireMaster, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const r = await pool.query(
+      `SELECT t.transaction_id, t.points_added, t.description, t.transaction_date,
+              u.username AS staff_name
+         FROM point_transactions t
+         LEFT JOIN staff_users u ON u.id = t.staff_id
+        WHERE t.member_id = $1 AND t.quarantine_status = 'pending'
+        ORDER BY t.transaction_date DESC`,
+      [id]
+    );
+    res.json(r.rows);
+  } catch (err) {
+    console.error('GET /api/members/:id/quarantine error:', err.message);
+    res.status(500).json({ error: 'Could not load pending transactions.' });
+  }
+});
+
+app.post('/api/transactions/:txId/approve', requireMaster, async (req, res) => {
+  const { txId } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const txQ = await client.query(
+      `UPDATE point_transactions SET quarantine_status = 'approved'
+        WHERE transaction_id = $1 AND quarantine_status = 'pending'
+        RETURNING member_id, points_added`,
+      [txId]
+    );
+    if (txQ.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'No pending transaction with that ID.' });
+    }
+    const memberId = txQ.rows[0].member_id;
+
+    // Unfreeze only when nothing else is pending for this member.
+    const pending = await client.query(
+      `SELECT 1 FROM point_transactions WHERE member_id = $1 AND quarantine_status = 'pending' LIMIT 1`,
+      [memberId]
+    );
+    const unfrozen = pending.rows.length === 0;
+    if (unfrozen) {
+      await client.query('UPDATE members SET is_frozen = false WHERE member_id = $1', [memberId]);
+    }
+    await client.query('COMMIT');
+
+    if (unfrozen) io.emit('memberUnfrozen', { memberId });
+    console.log(`Quarantine: tx #${txId} APPROVED by ${req.user.username}.`);
+    res.json({ success: true, unfrozen });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('POST /api/transactions/:txId/approve error:', err.message);
+    res.status(500).json({ error: 'Could not approve the transaction.' });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/transactions/:txId/reject', requireMaster, async (req, res) => {
+  const { txId } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const txQ = await client.query(
+      `UPDATE point_transactions SET quarantine_status = 'rejected'
+        WHERE transaction_id = $1 AND quarantine_status = 'pending'
+        RETURNING member_id, points_added, description`,
+      [txId]
+    );
+    if (txQ.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'No pending transaction with that ID.' });
+    }
+    const { member_id: memberId, points_added: pts } = txQ.rows[0];
+
+    // Reverse the points (floor at zero in case some were already redeemed —
+    // shouldn't happen while frozen, but belt-and-braces).
+    const upd = await client.query(
+      `UPDATE members
+          SET total_points = GREATEST(COALESCE(total_points, 0) - $1, 0)
+        WHERE member_id = $2
+        RETURNING total_points, full_name`,
+      [pts, memberId]
+    );
+
+    // Reversal record so the history explains itself.
+    await client.query(
+      `INSERT INTO point_transactions (member_id, points_added, description, staff_id, served_member_name)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [memberId, -pts, `Rejected quarantined transaction #${txId}`, req.user.id, upd.rows[0]?.full_name || null]
+    );
+
+    const pending = await client.query(
+      `SELECT 1 FROM point_transactions WHERE member_id = $1 AND quarantine_status = 'pending' LIMIT 1`,
+      [memberId]
+    );
+    const unfrozen = pending.rows.length === 0;
+    if (unfrozen) {
+      await client.query('UPDATE members SET is_frozen = false WHERE member_id = $1', [memberId]);
+    }
+    await client.query('COMMIT');
+
+    const newTotal = upd.rows[0]?.total_points ?? 0;
+    io.emit('pointsUpdated', { memberId, newTotal });
+    if (unfrozen) io.emit('memberUnfrozen', { memberId });
+    console.log(`Quarantine: tx #${txId} REJECTED by ${req.user.username}; ${pts} pts reversed.`);
+    res.json({ success: true, newTotal, unfrozen });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('POST /api/transactions/:txId/reject error:', err.message);
+    res.status(500).json({ error: 'Could not reject the transaction.' });
+  } finally {
+    client.release();
+  }
+});
+
 // ── Fraud interceptor: per-role single-transaction point ceilings ──
 // A staff member posting at/above their role's ceiling doesn't block the sale
 // — the points are RECORDED, but the member is quarantined (frozen) pending
@@ -1582,6 +1704,10 @@ app.post('/api/add-points', async (req, res) => {
     let wasQuarantined = false;
     if (shouldQuarantine && req.user.role !== 'Master') {
       await client.query('UPDATE members SET is_frozen = true WHERE member_id = $1', [memberId]);
+      await client.query(
+        `UPDATE point_transactions SET quarantine_status = 'pending' WHERE transaction_id = $1`,
+        [tx.transaction_id]
+      );
       wasQuarantined = true;
     }
 
@@ -1606,7 +1732,7 @@ app.post('/api/add-points', async (req, res) => {
           `Staff "${req.user.username}" (${req.user.role}) added ${numericPoints.toLocaleString()} points ` +
           `to customer "${target.full_name}" — at/above their role limit of ${roleLimit.toLocaleString()}.\n\n` +
           `Transaction #${tx.transaction_id} was RECORDED and the customer's account is now FROZEN pending review.\n\n` +
-          `Review transaction #${tx.transaction_id} on the dashboard: void it (deduct ${numericPoints.toLocaleString()} pts) if fraudulent, or simply unfreeze the customer if legitimate.`;
+          `On the dashboard, open the customer's card and Approve (keep the points) or Reject (reverse them) the pending transaction.`;
         for (const m of masters.rows) {
           sendTelegram(m.telegram_chat_id, alert).catch(e => console.error('Quarantine alert send failed:', e.message));
         }
@@ -1638,6 +1764,7 @@ app.get('/api/transactions/:memberId', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT t.transaction_id, t.points_added, t.description, t.transaction_date,
+              t.quarantine_status,
               u.username AS staff_name,
               c.car_plate, c.car_model
          FROM point_transactions t
