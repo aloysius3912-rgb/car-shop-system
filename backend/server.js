@@ -120,6 +120,8 @@ async function ensureVehicleModel() {
   await pool.query(`ALTER TABLE cars ADD COLUMN IF NOT EXISTS vehicle_id INT REFERENCES vehicles(vehicle_id);`);
   await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS vehicle_id INT REFERENCES vehicles(vehicle_id);`);
   await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS served_member_name VARCHAR(100);`);
+  // Fraud interceptor: frozen members can't earn or redeem until unfrozen.
+  await pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS is_frozen BOOLEAN DEFAULT false;`);
 
   // Backfill vehicles from every plate we already have on file.
   await pool.query(`
@@ -374,6 +376,154 @@ async function handleEodCommand(chatId) {
     `New customers: ${s.new_customers}`);
 }
 
+// /queue — today's active services (cars worked on today, SG time). Read-only.
+async function handleQueueCommand(chatId) {
+  const r = await pool.query(`
+    SELECT v.plate, v.car_model,
+           MAX(t.transaction_date) AS last_activity,
+           COUNT(*)::int AS services_today,
+           STRING_AGG(DISTINCT t.served_member_name, ', ') AS owners
+      FROM point_transactions t
+      JOIN vehicles v ON v.vehicle_id = t.vehicle_id
+     WHERE t.points_added > 0
+       AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date
+           = (NOW() AT TIME ZONE 'Asia/Singapore')::date
+     GROUP BY v.vehicle_id, v.plate, v.car_model
+     ORDER BY MAX(t.transaction_date) DESC`);
+  if (r.rows.length === 0) {
+    await sendTelegram(chatId, 'No cars serviced yet today.');
+    return;
+  }
+  const lines = r.rows.map(row => {
+    const time = new Date(row.last_activity).toLocaleTimeString('en-SG', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Singapore' });
+    return `• ${row.plate}${row.car_model ? ` (${row.car_model})` : ''} — ${row.services_today} service${row.services_today !== 1 ? 's' : ''}, last at ${time}${row.owners ? ` — ${row.owners}` : ''}`;
+  });
+  await sendTelegram(chatId, `Today's serviced vehicles (${r.rows.length}):\n\n${lines.join('\n')}`);
+}
+
+// /whois <plate> — quick context on a car before working on it. Read-only.
+async function handleWhoisCommand(chatId, plateRaw) {
+  const plate = (plateRaw || '').trim().toUpperCase();
+  if (!plate) { await sendTelegram(chatId, 'Usage: /whois SBA1234A'); return; }
+  const r = await pool.query(
+    `SELECT v.plate, v.car_model,
+            m.full_name AS owner, m.total_points,
+            (SELECT COUNT(*)::int FROM point_transactions t WHERE t.vehicle_id = v.vehicle_id) AS service_count
+       FROM vehicles v
+       LEFT JOIN cars c ON c.vehicle_id = v.vehicle_id
+       LEFT JOIN members m ON m.member_id = c.member_id AND m.deleted_at IS NULL
+      WHERE UPPER(v.plate) = $1
+      ORDER BY c.car_id DESC NULLS LAST
+      LIMIT 1`,
+    [plate]
+  );
+  if (r.rows.length === 0) {
+    await sendTelegram(chatId, `No vehicle on file for ${plate}.`);
+    return;
+  }
+  const row = r.rows[0];
+  await sendTelegram(chatId,
+    `${row.plate}${row.car_model ? ` — ${row.car_model}` : ''}\n` +
+    `Owner: ${row.owner || 'no active owner on file'}` +
+    (row.owner ? ` (${(Number(row.total_points) || 0).toLocaleString()} pts)` : '') + `\n` +
+    `Services on record: ${row.service_count}`);
+}
+
+// /leaderboard — top 5 customers by points. Read-only. Admin+.
+async function handleLeaderboardCommand(chatId) {
+  const r = await pool.query(
+    `SELECT full_name, total_points FROM members
+      WHERE deleted_at IS NULL
+      ORDER BY total_points DESC NULLS LAST, full_name ASC
+      LIMIT 5`);
+  if (r.rows.length === 0) { await sendTelegram(chatId, 'No customers on file yet.'); return; }
+  const medals = ['1.', '2.', '3.', '4.', '5.'];
+  const lines = r.rows.map((m, i) => `${medals[i]} ${m.full_name} — ${(Number(m.total_points) || 0).toLocaleString()} pts`);
+  await sendTelegram(chatId, `Top customers by points:\n\n${lines.join('\n')}`);
+}
+
+// /tx <plate> — last 3 transactions incl. transaction_id (for voiding on the
+// dashboard). Read-only. Admin+.
+async function handleTxCommand(chatId, plateRaw) {
+  const plate = (plateRaw || '').trim().toUpperCase();
+  if (!plate) { await sendTelegram(chatId, 'Usage: /tx SBA1234A'); return; }
+  const r = await pool.query(
+    `SELECT t.transaction_id, t.transaction_date, t.description, t.points_added,
+            u.username AS staff_name
+       FROM point_transactions t
+       JOIN vehicles v ON v.vehicle_id = t.vehicle_id
+       LEFT JOIN staff_users u ON u.id = t.staff_id
+      WHERE UPPER(v.plate) = $1
+      ORDER BY t.transaction_date DESC
+      LIMIT 3`,
+    [plate]
+  );
+  if (r.rows.length === 0) { await sendTelegram(chatId, `No transactions on record for ${plate}.`); return; }
+  const lines = r.rows.map(t => {
+    const d = new Date(t.transaction_date).toLocaleString('en-SG', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Singapore' });
+    const sign = t.points_added >= 0 ? '+' : '';
+    return `#${t.transaction_id} · ${d}\n${t.description || 'Service'} · ${sign}${t.points_added} pts${t.staff_name ? ` · by ${t.staff_name}` : ''}`;
+  });
+  await sendTelegram(chatId, `Last ${r.rows.length} transactions for ${plate}:\n\n${lines.join('\n\n')}`);
+}
+
+// /staff — all staff, roles, 2FA link status. Read-only. Master only.
+async function handleStaffListCommand(chatId) {
+  const r = await pool.query(
+    `SELECT username, role, (telegram_chat_id IS NOT NULL) AS linked
+       FROM staff_users ORDER BY
+       CASE role WHEN 'Master' THEN 0 WHEN 'Admin' THEN 1 ELSE 2 END, username ASC`);
+  const lines = r.rows.map(s => `• ${s.username} — ${s.role} — 2FA ${s.linked ? 'linked' : 'NOT linked'}`);
+  await sendTelegram(chatId, `Staff (${r.rows.length}):\n\n${lines.join('\n')}`);
+}
+
+// /audit <username> — last 10 point actions by that staff member. Master only.
+async function handleAuditCommand(chatId, usernameRaw) {
+  const username = (usernameRaw || '').trim();
+  if (!username) { await sendTelegram(chatId, 'Usage: /audit aloysius'); return; }
+  const staffQ = await pool.query('SELECT id, username FROM staff_users WHERE LOWER(username) = LOWER($1)', [username]);
+  if (staffQ.rows.length === 0) { await sendTelegram(chatId, `No staff member named "${username}".`); return; }
+  const staff = staffQ.rows[0];
+  const r = await pool.query(
+    `SELECT t.transaction_id, t.transaction_date, t.description, t.points_added,
+            t.served_member_name, v.plate
+       FROM point_transactions t
+       LEFT JOIN vehicles v ON v.vehicle_id = t.vehicle_id
+      WHERE t.staff_id = $1
+      ORDER BY t.transaction_date DESC
+      LIMIT 10`,
+    [staff.id]
+  );
+  if (r.rows.length === 0) { await sendTelegram(chatId, `${staff.username} has no point transactions on record.`); return; }
+  const lines = r.rows.map(t => {
+    const d = new Date(t.transaction_date).toLocaleString('en-SG', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Singapore' });
+    const sign = t.points_added >= 0 ? '+' : '';
+    return `#${t.transaction_id} · ${d} · ${sign}${t.points_added} pts · ${t.description || 'Service'}${t.plate ? ` · ${t.plate}` : ''}${t.served_member_name ? ` · ${t.served_member_name}` : ''}`;
+  });
+  await sendTelegram(chatId, `Last ${r.rows.length} point actions by ${staff.username}:\n\n${lines.join('\n')}`);
+}
+
+// /backup — row-count health check. Read-only. Master only.
+async function handleBackupCommand(chatId) {
+  const r = await pool.query(`
+    SELECT
+      (SELECT COUNT(*) FROM members)::int AS members,
+      (SELECT COUNT(*) FROM members WHERE deleted_at IS NULL)::int AS active_members,
+      (SELECT COUNT(*) FROM vehicles)::int AS vehicles,
+      (SELECT COUNT(*) FROM cars)::int AS ownership_links,
+      (SELECT COUNT(*) FROM point_transactions)::int AS transactions,
+      (SELECT COUNT(*) FROM staff_users)::int AS staff
+  `);
+  const s = r.rows[0];
+  await sendTelegram(chatId,
+    `System health — row counts:\n\n` +
+    `Members: ${s.members} (${s.active_members} active)\n` +
+    `Vehicles: ${s.vehicles}\n` +
+    `Ownership links: ${s.ownership_links}\n` +
+    `Transactions: ${s.transactions}\n` +
+    `Staff: ${s.staff}`);
+}
+
 // Route a message from a verified staff member, gated by their exact role.
 async function handleStaffMessage(chatId, staff, text) {
   const parts = text.trim().split(/\s+/);
@@ -387,12 +537,60 @@ async function handleStaffMessage(chatId, staff, text) {
       await handleLookupCommand(chatId, arg);
       return;
 
+    case '/queue':
+      await handleQueueCommand(chatId);
+      return;
+
+    case '/whois':
+      await handleWhoisCommand(chatId, arg);
+      return;
+
     case '/customer':
       if (!isAdminPlus) {
         await sendTelegram(chatId, 'You do not have permission to use /customer.');
         return;
       }
       await handleCustomerCommand(chatId, arg);
+      return;
+
+    case '/leaderboard':
+      if (!isAdminPlus) {
+        await sendTelegram(chatId, 'You do not have permission to use /leaderboard.');
+        return;
+      }
+      await handleLeaderboardCommand(chatId);
+      return;
+
+    case '/tx':
+      if (!isAdminPlus) {
+        await sendTelegram(chatId, 'You do not have permission to use /tx.');
+        return;
+      }
+      await handleTxCommand(chatId, arg);
+      return;
+
+    case '/staff':
+      if (!isMaster) {
+        await sendTelegram(chatId, 'Only the Master can use /staff.');
+        return;
+      }
+      await handleStaffListCommand(chatId);
+      return;
+
+    case '/audit':
+      if (!isMaster) {
+        await sendTelegram(chatId, 'Only the Master can use /audit.');
+        return;
+      }
+      await handleAuditCommand(chatId, arg);
+      return;
+
+    case '/backup':
+      if (!isMaster) {
+        await sendTelegram(chatId, 'Only the Master can use /backup.');
+        return;
+      }
+      await handleBackupCommand(chatId);
       return;
 
     case '/eod': {
@@ -424,12 +622,24 @@ async function handleStaffMessage(chatId, staff, text) {
 
     case '/start':
     case '/help': {
-      const lines = [`Staff commands (${staff.role}):`, '/lookup <plate> — service history of a car'];
+      const lines = [
+        `Staff commands (${staff.role}):`,
+        '/lookup <plate> — service history of a car',
+        '/queue — vehicles serviced today',
+        '/whois <plate> — quick owner/car context',
+      ];
       if (isAdminPlus) {
         lines.push('/customer <name> — customer profile, points, cars');
+        lines.push('/leaderboard — top 5 customers by points');
+        lines.push('/tx <plate> — last 3 transactions with IDs');
         lines.push('/eod — end-of-day report' + (isMaster ? '' : ' (if enabled by Master)'));
       }
-      if (isMaster) lines.push('/toggle_reports — enable/disable Admin EOD reports');
+      if (isMaster) {
+        lines.push('/staff — all staff + 2FA status');
+        lines.push('/audit <username> — last 10 point actions by a staff member');
+        lines.push('/backup — row-count health check');
+        lines.push('/toggle_reports — enable/disable Admin EOD reports');
+      }
       await sendTelegram(chatId, lines.join('\n'));
       return;
     }
@@ -1230,6 +1440,30 @@ app.delete('/api/delete-car/:carId', async (req, res) => {
 });
 
 // ── Add or deduct points ──
+// ── Unfreeze a member after fraud-interceptor review ──
+// Master-gated deliberately: the interceptor exists to catch compromised
+// staff accounts, and the freeze alert goes to Masters — so only a Master
+// signs off on releasing it (e.g. the big addition was a legitimate sale).
+app.post('/api/members/:id/unfreeze', requireMaster, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      'UPDATE members SET is_frozen = false WHERE member_id = $1 RETURNING full_name',
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Member not found' });
+    console.log(`Member ${id} (${result.rows[0].full_name}) unfrozen by ${req.user.username}.`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/members/:id/unfreeze error:', err.message);
+    res.status(500).json({ error: 'Could not unfreeze the member. Please try again.' });
+  }
+});
+
+// Single-transaction point ceiling: anything at or above this trips the
+// fraud interceptor (freeze + block + alert Masters).
+const FRAUD_POINT_THRESHOLD = 2000;
+
 app.post('/api/add-points', async (req, res) => {
   const { memberId, points, description, carId } = req.body;
   const numericPoints = parseInt(points, 10) || 0;
@@ -1239,6 +1473,56 @@ app.post('/api/add-points', async (req, res) => {
   if (!can(req.user, perm)) {
     return res.status(403).json({ error: `You do not have permission to ${numericPoints < 0 ? 'deduct' : 'add'} points.` });
   }
+
+  // ── FRAUD INTERCEPTOR ──
+  try {
+    const memberQ = await pool.query(
+      'SELECT full_name, is_frozen FROM members WHERE member_id = $1',
+      [memberId]
+    );
+    if (memberQ.rows.length === 0) {
+      return res.status(404).json({ error: 'Member not found' });
+    }
+    const target = memberQ.rows[0];
+
+    // Frozen accounts can't earn or redeem under any circumstances.
+    if (target.is_frozen) {
+      return res.status(422).json({
+        error: `This account is FROZEN pending review. A Master must unfreeze it before any points can be added or redeemed.`,
+      });
+    }
+
+    // Anomalously large single addition: freeze the target, block, alert Masters.
+    if (numericPoints >= FRAUD_POINT_THRESHOLD) {
+      await pool.query('UPDATE members SET is_frozen = true WHERE member_id = $1', [memberId]);
+
+      // Priority alert to every linked Master (fire-and-forget; the block
+      // stands even if Telegram is down).
+      pool.query(
+        `SELECT username, telegram_chat_id FROM staff_users
+          WHERE role = 'Master' AND telegram_chat_id IS NOT NULL`
+      ).then(masters => {
+        const alert =
+          `SECURITY ALERT — Fraud Interceptor\n\n` +
+          `Staff "${req.user.username}" attempted to add ${numericPoints.toLocaleString()} points ` +
+          `to customer "${target.full_name}" in a single transaction (threshold: ${FRAUD_POINT_THRESHOLD.toLocaleString()}).\n\n` +
+          `The transaction was BLOCKED and the customer's account has been FROZEN. ` +
+          `Review it, then unfreeze from the dashboard if this was a legitimate sale.`;
+        for (const m of masters.rows) {
+          sendTelegram(m.telegram_chat_id, alert).catch(e => console.error('Fraud alert send failed:', e.message));
+        }
+      }).catch(e => console.error('Fraud alert lookup failed:', e.message));
+
+      console.warn(`FRAUD INTERCEPTOR: blocked ${numericPoints} pts by "${req.user.username}" to member ${memberId}; account frozen.`);
+      return res.status(422).json({
+        error: `Blocked: single additions of ${FRAUD_POINT_THRESHOLD}+ points trip the fraud interceptor. The customer's account has been frozen and Masters have been alerted.`,
+      });
+    }
+  } catch (err) {
+    console.error('POST /api/add-points interceptor error:', err.message);
+    return res.status(500).json({ error: 'Could not update points. Please try again.' });
+  }
+  // ── end interceptor ──
 
   // car_id only applies to earning (a service done on a specific car).
   // For deductions (redemptions) it stays null.
