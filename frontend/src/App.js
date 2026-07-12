@@ -1578,6 +1578,9 @@ export default function App() {
       setMembers(prev => prev.map(m => m.member_id == memberId ? { ...m, total_points: newTotal } : m));
     });
     socket.on('memberAdded', (newMember) => setMembers(prev => [...prev, newMember]));
+    socket.on('memberFrozen', ({ memberId }) => {
+      setMembers(prev => prev.map(m => m.member_id == memberId ? { ...m, is_frozen: true } : m));
+    });
     socket.on('memberDeleted', ({ memberId }) => setMembers(prev => prev.filter(m => m.member_id != memberId)));
     socket.on('carAdded', ({ memberId, car }) => {
       setMembers(prev => prev.map(m => m.member_id === memberId ? { ...m, cars: [...(m.cars || []), car] } : m));
@@ -1594,7 +1597,7 @@ export default function App() {
     return () => {
       socket.off('connect'); socket.off('disconnect'); socket.off('connect_error');
       socket.off('pointsUpdated');
-      socket.off('memberAdded'); socket.off('memberDeleted');
+      socket.off('memberAdded'); socket.off('memberDeleted'); socket.off('memberFrozen');
       socket.off('carAdded'); socket.off('carDeleted'); socket.off('transactionAdded');
       socket.disconnect();
     };
@@ -1647,11 +1650,17 @@ export default function App() {
     }
     const description = (descriptions[id] || '').trim() || 'Manual Adjustment';
     try {
-      await apiFetch('/api/add-points', {
+      const data = await apiFetch('/api/add-points', {
         method: 'POST',
         body: JSON.stringify({ memberId: id, points: pts, description, carId }),
       });
-      toast(`${pts >= 0 ? '+' : ''}${pts} pts · ${description}`);
+      if (data && data.quarantined) {
+        // Points recorded, but the account was quarantined pending Master review.
+        toast(data.warning || 'Points recorded — account locked pending Master approval.', 'warn');
+        setMembers(prev => prev.map(m => m.member_id == id ? { ...m, is_frozen: true } : m));
+      } else {
+        toast(`${pts >= 0 ? '+' : ''}${pts} pts · ${description}`);
+      }
       setAdjustments(prev => ({ ...prev, [id]: '' }));
       setDescriptions(prev => ({ ...prev, [id]: '' }));
       setOpenPointsPanel(null);

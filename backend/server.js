@@ -1487,112 +1487,61 @@ app.post('/api/staff/:id/enable', requireMaster, async (req, res) => {
   }
 });
 
-// Single-transaction point ceiling: anything at or above this trips the
-// fraud interceptor (freeze + block + alert Masters).
-const FRAUD_POINT_THRESHOLD = 2000;
+// ── Fraud interceptor: per-role single-transaction point ceilings ──
+// A staff member posting at/above their role's ceiling doesn't block the sale
+// — the points are RECORDED, but the member is quarantined (frozen) pending
+// Master review, with the exact transaction_id in the alert for easy voiding.
+const FRAUD_POINT_THRESHOLD = 2000; // base (Technician) threshold
+const ROLE_POINT_LIMITS = {
+  Technician: FRAUD_POINT_THRESHOLD, // 2000
+  Admin: 5000,
+  Master: Infinity,                  // Masters are never quarantined
+};
 
 app.post('/api/add-points', async (req, res) => {
   const { memberId, points, description, carId } = req.body;
   const numericPoints = parseInt(points, 10) || 0;
 
-  // Enforce add vs deduct permission based on the sign of the points.
+  // 1) Authorization: add vs deduct permission based on the sign.
   const perm = numericPoints < 0 ? 'can_deduct_points' : 'can_add_points';
   if (!can(req.user, perm)) {
     return res.status(403).json({ error: `You do not have permission to ${numericPoints < 0 ? 'deduct' : 'add'} points.` });
   }
 
-  // ── FRAUD INTERCEPTOR ──
-  try {
-    const memberQ = await pool.query(
-      'SELECT full_name, is_frozen FROM members WHERE member_id = $1',
-      [memberId]
-    );
-    if (memberQ.rows.length === 0) {
-      return res.status(404).json({ error: 'Member not found' });
-    }
-    const target = memberQ.rows[0];
-
-    // Frozen accounts can't earn or redeem under any circumstances.
-    if (target.is_frozen) {
-      return res.status(422).json({
-        error: `This account is FROZEN pending review. A Master must unfreeze it before any points can be added or redeemed.`,
-      });
-    }
-
-    // Anomalously large single addition.
-    if (numericPoints >= FRAUD_POINT_THRESHOLD) {
-      // ── Master override ──
-      // Legitimate big sales happen (e.g. a full upgrade package). A Master
-      // posting the points is the approval: the transaction goes through,
-      // and an informational alert still goes to all Masters as an audit
-      // trail. Admin/Technician attempts below are always blocked.
-      if (req.user.role === 'Master') {
-        pool.query(
-          `SELECT username, telegram_chat_id FROM staff_users
-            WHERE role = 'Master' AND telegram_chat_id IS NOT NULL`
-        ).then(masters => {
-          const note =
-            `Large transaction notice\n\n` +
-            `Master "${req.user.username}" added ${numericPoints.toLocaleString()} points ` +
-            `to customer "${target.full_name}" (threshold: ${FRAUD_POINT_THRESHOLD.toLocaleString()}).\n\n` +
-            `This was allowed because a Master posted it. No action needed if this was you.`;
-          for (const m of masters.rows) {
-            sendTelegram(m.telegram_chat_id, note).catch(e => console.error('Large-tx notice send failed:', e.message));
-          }
-        }).catch(e => console.error('Large-tx notice lookup failed:', e.message));
-        console.warn(`FRAUD INTERCEPTOR: Master override — ${numericPoints} pts by "${req.user.username}" to member ${memberId} allowed.`);
-        // fall through to the normal points logic below
-      } else {
-        // Freeze the target, disable the offending (compromised) staff
-        // account, block, and alert Masters.
-        await pool.query('UPDATE members SET is_frozen = true WHERE member_id = $1', [memberId]);
-
-        // Kill their sessions so a compromised live session is booted immediately.
-        await pool.query('UPDATE staff_users SET is_disabled = true WHERE id = $1', [req.user.id]);
-        await pool.query('DELETE FROM sessions WHERE staff_id = $1', [req.user.id]);
-
-        // Priority alert to every linked Master (fire-and-forget; the block
-        // stands even if Telegram is down).
-        pool.query(
-          `SELECT username, telegram_chat_id FROM staff_users
-            WHERE role = 'Master' AND telegram_chat_id IS NOT NULL`
-        ).then(masters => {
-          const alert =
-            `SECURITY ALERT — Fraud Interceptor\n\n` +
-            `Staff "${req.user.username}" attempted to add ${numericPoints.toLocaleString()} points ` +
-            `to customer "${target.full_name}" in a single transaction (threshold: ${FRAUD_POINT_THRESHOLD.toLocaleString()}).\n\n` +
-            `The transaction was BLOCKED, the customer's account has been FROZEN, ` +
-            `and the staff account "${req.user.username}" has been DISABLED and logged out.\n\n` +
-            `If this was a legitimate sale: unfreeze the customer and re-enable the staff account from the dashboard, then post the points from a Master account.`;
-          for (const m of masters.rows) {
-            sendTelegram(m.telegram_chat_id, alert).catch(e => console.error('Fraud alert send failed:', e.message));
-          }
-        }).catch(e => console.error('Fraud alert lookup failed:', e.message));
-
-        console.warn(`FRAUD INTERCEPTOR: blocked ${numericPoints} pts by "${req.user.username}" to member ${memberId}; customer frozen, staff disabled.`);
-        return res.status(422).json({
-          error: `Blocked: single additions of ${FRAUD_POINT_THRESHOLD}+ points must be posted by a Master. The customer's account has been frozen, your account has been disabled, and Masters have been alerted.`,
-        });
-      }
-    }
-  } catch (err) {
-    console.error('POST /api/add-points interceptor error:', err.message);
-    return res.status(500).json({ error: 'Could not update points. Please try again.' });
-  }
-  // ── end interceptor ──
-
   // car_id only applies to earning (a service done on a specific car).
   // For deductions (redemptions) it stays null.
   const carIdToLog = numericPoints >= 0 && carId ? parseInt(carId, 10) : null;
 
-  // Everything runs on ONE client inside a transaction so the balance
-  // update and the history log either both happen or neither does.
+  // Does this addition cross the poster's role ceiling? (Masters: never.)
+  const roleLimit = ROLE_POINT_LIMITS[req.user.role] ?? FRAUD_POINT_THRESHOLD;
+  const shouldQuarantine = numericPoints >= roleLimit;
+
+  // Everything — freeze check, balance update, history insert, quarantine —
+  // runs on ONE client inside a single transaction: all of it happens or
+  // none of it does.
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Atomic conditional update: the WHERE clause enforces "never below zero"
-    // in the same statement as the update, so concurrent requests can't
+    // 2) Initial freeze check (row-locked so a concurrent request can't race it).
+    const memberQ = await client.query(
+      'SELECT full_name, is_frozen FROM members WHERE member_id = $1 FOR UPDATE',
+      [memberId]
+    );
+    if (memberQ.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Member not found' });
+    }
+    const target = memberQ.rows[0];
+    if (target.is_frozen) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({
+        error: 'This account is FROZEN. A Master must unfreeze it before any points can be added or redeemed.',
+      });
+    }
+
+    // 3) Execution: atomic conditional update — the WHERE clause enforces
+    // "never below zero" in the same statement, so concurrent requests can't
     // both slip past a separate balance check (no check-then-act race).
     const result = await client.query(
       `UPDATE members
@@ -1602,18 +1551,10 @@ app.post('/api/add-points', async (req, res) => {
        RETURNING total_points`,
       [numericPoints, memberId]
     );
-
     if (result.rows.length === 0) {
       await client.query('ROLLBACK');
-      // Distinguish "member missing" from "not enough points" for a clear message
-      const check = await pool.query(
-        'SELECT total_points FROM members WHERE member_id = $1',
-        [memberId]
-      );
-      if (check.rows.length === 0) {
-        return res.status(404).json({ error: 'Member not found' });
-      }
-      const current = check.rows[0].total_points || 0;
+      const check = await pool.query('SELECT total_points FROM members WHERE member_id = $1', [memberId]);
+      const current = Number(check.rows[0]?.total_points) || 0;
       return res.status(400).json({
         error: `Not enough points! Member has ${current} pts, cannot deduct ${Math.abs(numericPoints)} pts.`,
       });
@@ -1626,22 +1567,62 @@ app.post('/api/add-points', async (req, res) => {
       const vq = await client.query('SELECT vehicle_id FROM cars WHERE car_id = $1', [carIdToLog]);
       vehicleIdToLog = vq.rows[0]?.vehicle_id || null;
     }
-    const nameQ = await client.query('SELECT full_name FROM members WHERE member_id = $1', [memberId]);
-    const servedName = nameQ.rows[0]?.full_name || null;
 
+    // Logging: the history record, returning the generated transaction_id.
     const txResult = await client.query(
       `INSERT INTO point_transactions (member_id, points_added, description, staff_id, car_id, vehicle_id, served_member_name)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING transaction_id, points_added, description, transaction_date, staff_id, car_id`,
-      [memberId, numericPoints, description, req.user.id, carIdToLog, vehicleIdToLog, servedName]
+      [memberId, numericPoints, description, req.user.id, carIdToLog, vehicleIdToLog, target.full_name]
     );
+    const tx = txResult.rows[0];
 
+    // 4) QUARANTINE INTERCEPTOR: non-Master at/above their ceiling → the
+    // points stand, but the account locks until a Master reviews.
+    let wasQuarantined = false;
+    if (shouldQuarantine && req.user.role !== 'Master') {
+      await client.query('UPDATE members SET is_frozen = true WHERE member_id = $1', [memberId]);
+      wasQuarantined = true;
+    }
+
+    // 5) Commit, then emits + alerts + response.
     await client.query('COMMIT');
 
     const newTotal = result.rows[0].total_points;
     io.emit('pointsUpdated', { memberId, newTotal });
-    io.emit('transactionAdded', { memberId, transaction: txResult.rows[0] });
-    res.json({ success: true, newTotal });
+    io.emit('transactionAdded', { memberId, transaction: tx });
+
+    if (wasQuarantined) {
+      io.emit('memberFrozen', { memberId });
+
+      // Priority alert to every linked Master with the exact transaction id
+      // (fire-and-forget; the quarantine stands even if Telegram is down).
+      pool.query(
+        `SELECT username, telegram_chat_id FROM staff_users
+          WHERE role = 'Master' AND telegram_chat_id IS NOT NULL`
+      ).then(masters => {
+        const alert =
+          `SECURITY ALERT — Quarantine Interceptor\n\n` +
+          `Staff "${req.user.username}" (${req.user.role}) added ${numericPoints.toLocaleString()} points ` +
+          `to customer "${target.full_name}" — at/above their role limit of ${roleLimit.toLocaleString()}.\n\n` +
+          `Transaction #${tx.transaction_id} was RECORDED and the customer's account is now FROZEN pending review.\n\n` +
+          `Review transaction #${tx.transaction_id} on the dashboard: void it (deduct ${numericPoints.toLocaleString()} pts) if fraudulent, or simply unfreeze the customer if legitimate.`;
+        for (const m of masters.rows) {
+          sendTelegram(m.telegram_chat_id, alert).catch(e => console.error('Quarantine alert send failed:', e.message));
+        }
+      }).catch(e => console.error('Quarantine alert lookup failed:', e.message));
+
+      console.warn(`QUARANTINE: tx #${tx.transaction_id} — ${numericPoints} pts by "${req.user.username}" (${req.user.role}, limit ${roleLimit}) to member ${memberId}; member frozen.`);
+      return res.status(201).json({
+        success: true,
+        newTotal,
+        transactionId: tx.transaction_id,
+        quarantined: true,
+        warning: `Points recorded (transaction #${tx.transaction_id}), but this exceeds your ${roleLimit.toLocaleString()}-point limit — the customer's account is temporarily locked pending Master approval. Masters have been notified.`,
+      });
+    }
+
+    res.status(200).json({ success: true, newTotal, transactionId: tx.transaction_id });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('POST /api/add-points error:', err.message);
