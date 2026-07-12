@@ -122,6 +122,9 @@ async function ensureVehicleModel() {
   await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS served_member_name VARCHAR(100);`);
   // Fraud interceptor: frozen members can't earn or redeem until unfrozen.
   await pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS is_frozen BOOLEAN DEFAULT false;`);
+  // Fraud interceptor: a staff account that trips the interceptor is disabled
+  // (can't log in or make requests) until a Master re-enables it.
+  await pool.query(`ALTER TABLE staff_users ADD COLUMN IF NOT EXISTS is_disabled BOOLEAN DEFAULT false;`);
 
   // Backfill vehicles from every plate we already have on file.
   await pool.query(`
@@ -189,7 +192,7 @@ async function createSession(staffId, role) {
 async function getSessionUser(token) {
   if (!token) return null;
   const result = await pool.query(
-    `SELECT s.staff_id AS id, s.role, u.username,
+    `SELECT s.staff_id AS id, s.role, u.username, u.is_disabled,
             u.can_add_member, u.can_delete_member, u.can_add_points, u.can_deduct_points
        FROM sessions s JOIN staff_users u ON u.id = s.staff_id
       WHERE s.token = $1 AND s.expires_at > NOW()`,
@@ -840,7 +843,7 @@ app.post('/api/login', loginRateLimiter, async (req, res) => {
   }
   try {
     const result = await pool.query(
-      'SELECT id, username, password_hash, role, telegram_chat_id, require_2fa FROM staff_users WHERE LOWER(username) = LOWER($1)',
+      'SELECT id, username, password_hash, role, telegram_chat_id, require_2fa, is_disabled FROM staff_users WHERE LOWER(username) = LOWER($1)',
       [username.trim()]
     );
     const user = result.rows[0];
@@ -849,6 +852,10 @@ app.post('/api/login', loginRateLimiter, async (req, res) => {
     const hash = user?.password_hash || '$2a$12$invalidinvalidinvalidinvaliduuuuuuuuuuuuuuuuuuuuuuuuu';
     const match = await bcrypt.compare(password, hash);
     if (user && match) {
+      // Disabled by the fraud interceptor → refuse login until re-enabled.
+      if (user.is_disabled) {
+        return res.status(403).json({ error: 'This staff account has been disabled pending review. Contact a Master.' });
+      }
       // ── Telegram 2FA branch ──
       // If this staff member has linked Telegram (and the bot is configured),
       // don't create a session yet: send a 4-digit PIN and return a short-lived
@@ -970,6 +977,9 @@ app.use('/api', async (req, res, next) => {
     const user = await getSessionUser(req.headers['x-admin-token']);
     if (!user) {
       return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (user.is_disabled) {
+      return res.status(403).json({ error: 'This staff account has been disabled. Contact a Master.' });
     }
     req.user = user; // { id, role, username } available to every route
     next();
@@ -1132,7 +1142,7 @@ app.get('/api/staff', requireAdmin, async (req, res) => {
     const result = await pool.query(
       `SELECT id, username, role, can_add_member, can_delete_member,
               can_add_points, can_deduct_points, created_at,
-              require_2fa, (telegram_chat_id IS NOT NULL) AS telegram_linked
+              require_2fa, is_disabled, (telegram_chat_id IS NOT NULL) AS telegram_linked
          FROM staff_users ${hideMasters} ORDER BY created_at ASC`
     );
     res.json(result.rows);
@@ -1460,6 +1470,23 @@ app.post('/api/members/:id/unfreeze', requireMaster, async (req, res) => {
   }
 });
 
+// ── Re-enable a staff account disabled by the fraud interceptor (Master) ──
+app.post('/api/staff/:id/enable', requireMaster, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      'UPDATE staff_users SET is_disabled = false WHERE id = $1 RETURNING username',
+      [id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Staff member not found' });
+    console.log(`Staff ${id} (${result.rows[0].username}) re-enabled by ${req.user.username}.`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('POST /api/staff/:id/enable error:', err.message);
+    res.status(500).json({ error: 'Could not re-enable the staff account. Please try again.' });
+  }
+});
+
 // Single-transaction point ceiling: anything at or above this trips the
 // fraud interceptor (freeze + block + alert Masters).
 const FRAUD_POINT_THRESHOLD = 2000;
@@ -1492,9 +1519,20 @@ app.post('/api/add-points', async (req, res) => {
       });
     }
 
-    // Anomalously large single addition: freeze the target, block, alert Masters.
+    // Anomalously large single addition: freeze the target, disable the
+    // offending (compromised) staff account, block, and alert Masters.
     if (numericPoints >= FRAUD_POINT_THRESHOLD) {
       await pool.query('UPDATE members SET is_frozen = true WHERE member_id = $1', [memberId]);
+
+      // Disable the staff account that attempted it — but NEVER a Master
+      // (that could lock the owner out of their own shop). Kill their sessions
+      // so a compromised live session is booted immediately.
+      let staffDisabled = false;
+      if (req.user.role !== 'Master') {
+        await pool.query('UPDATE staff_users SET is_disabled = true WHERE id = $1', [req.user.id]);
+        await pool.query('DELETE FROM sessions WHERE staff_id = $1', [req.user.id]);
+        staffDisabled = true;
+      }
 
       // Priority alert to every linked Master (fire-and-forget; the block
       // stands even if Telegram is down).
@@ -1506,16 +1544,19 @@ app.post('/api/add-points', async (req, res) => {
           `SECURITY ALERT — Fraud Interceptor\n\n` +
           `Staff "${req.user.username}" attempted to add ${numericPoints.toLocaleString()} points ` +
           `to customer "${target.full_name}" in a single transaction (threshold: ${FRAUD_POINT_THRESHOLD.toLocaleString()}).\n\n` +
-          `The transaction was BLOCKED and the customer's account has been FROZEN. ` +
-          `Review it, then unfreeze from the dashboard if this was a legitimate sale.`;
+          `The transaction was BLOCKED and the customer's account has been FROZEN.\n` +
+          (staffDisabled
+            ? `The staff account "${req.user.username}" has been DISABLED and logged out.\n\n`
+            : `(Staff is a Master, so the account was not disabled.)\n\n`) +
+          `Review it, then unfreeze the customer and re-enable the staff account from the dashboard if this was legitimate.`;
         for (const m of masters.rows) {
           sendTelegram(m.telegram_chat_id, alert).catch(e => console.error('Fraud alert send failed:', e.message));
         }
       }).catch(e => console.error('Fraud alert lookup failed:', e.message));
 
-      console.warn(`FRAUD INTERCEPTOR: blocked ${numericPoints} pts by "${req.user.username}" to member ${memberId}; account frozen.`);
+      console.warn(`FRAUD INTERCEPTOR: blocked ${numericPoints} pts by "${req.user.username}" to member ${memberId}; customer frozen${staffDisabled ? ', staff disabled' : ''}.`);
       return res.status(422).json({
-        error: `Blocked: single additions of ${FRAUD_POINT_THRESHOLD}+ points trip the fraud interceptor. The customer's account has been frozen and Masters have been alerted.`,
+        error: `Blocked: single additions of ${FRAUD_POINT_THRESHOLD}+ points trip the fraud interceptor. The customer's account has been frozen${staffDisabled ? ' and your account has been disabled' : ''}, and Masters have been alerted.`,
       });
     }
   } catch (err) {

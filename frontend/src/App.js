@@ -1029,6 +1029,16 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
     }
   };
 
+  const enableStaff = async (member) => {
+    try {
+      await apiFetch(`/api/staff/${member.id}/enable`, { method: 'POST' });
+      toast(`${member.username} re-enabled.`);
+      load();
+    } catch (err) {
+      toast(`Re-enable failed: ${err.message}`, 'error');
+    }
+  };
+
   const unlinkTelegram = async (member) => {
     if (!window.confirm(`Remove ${member.username}'s Telegram link? They'll be logged out and can log in with password only (until they re-link).`)) return;
     try {
@@ -1094,10 +1104,18 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
                     }}>
                       {member.telegram_linked ? '2FA ON' : 'NO 2FA'}
                     </span>
+                    {member.is_disabled && (
+                      <span style={{ background: '#ef444422', color: '#ef4444', border: '1px solid #ef444466', padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700, letterSpacing: 1 }}>
+                        DISABLED
+                      </span>
+                    )}
                     {member.id === currentUserId && <span style={{ fontSize: 10, color: theme.textFaint }}>(you)</span>}
                   </div>
                   {canManage(member) ? (
                   <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    {isMaster && member.is_disabled && (
+                      <button onClick={() => enableStaff(member)} style={{ background: '#10b98118', border: '1px solid #10b98155', color: '#10b981', borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>Re-enable</button>
+                    )}
                     <button onClick={() => toggleRequire2fa(member)} title="When required, this user is pushed to link Telegram at login and cannot unlink it themselves." style={{
                       background: member.require_2fa ? '#f59e0b18' : 'none',
                       border: `1px solid ${member.require_2fa ? '#f59e0b55' : theme.border}`,
@@ -1639,6 +1657,21 @@ export default function App() {
       setOpenPointsPanel(null);
     } catch (err) {
       toast(`Points update failed: ${err.message}`, 'error');
+      // Fraud interceptor freezes the account server-side — reflect it at once.
+      if (/frozen|fraud interceptor/i.test(err.message || '')) {
+        setMembers(prev => prev.map(m => m.member_id == id ? { ...m, is_frozen: true } : m));
+        setOpenPointsPanel(null);
+      }
+    }
+  };
+
+  const handleUnfreeze = async (memberId, name) => {
+    try {
+      await apiFetch(`/api/members/${memberId}/unfreeze`, { method: 'POST' });
+      setMembers(prev => prev.map(m => m.member_id === memberId ? { ...m, is_frozen: false } : m));
+      toast(`${name} unfrozen — normal operations resumed.`);
+    } catch (err) {
+      toast(`Unfreeze failed: ${err.message}`, 'error');
     }
   };
 
@@ -1852,6 +1885,11 @@ export default function App() {
                         <span style={{ background: `${tier.color}18`, color: tier.color, border: `1px solid ${tier.color}44`, padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700, letterSpacing: 1.5 }}>
                           {tier.label}
                         </span>
+                        {member.is_frozen && (
+                          <span style={{ background: '#ef444422', color: '#ef4444', border: '1px solid #ef444466', padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700, letterSpacing: 1.5 }}>
+                            FROZEN
+                          </span>
+                        )}
                       </div>
 
                       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 8 }}>
@@ -1867,6 +1905,9 @@ export default function App() {
 
                     {/* CONTROLS */}
                     <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                      {isMaster && member.is_frozen && (
+                        <button onClick={() => handleUnfreeze(member.member_id, member.full_name)} style={btnStyle('#10b98122', '#10b981', { border: '1px solid #10b98155' })}>Unfreeze</button>
+                      )}
                       {(can('can_add_points') || can('can_deduct_points')) && (
                         <button
                           onClick={() => setOpenPointsPanel(prev => prev === member.member_id ? null : member.member_id)}
