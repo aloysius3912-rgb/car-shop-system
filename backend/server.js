@@ -1519,45 +1519,61 @@ app.post('/api/add-points', async (req, res) => {
       });
     }
 
-    // Anomalously large single addition: freeze the target, disable the
-    // offending (compromised) staff account, block, and alert Masters.
+    // Anomalously large single addition.
     if (numericPoints >= FRAUD_POINT_THRESHOLD) {
-      await pool.query('UPDATE members SET is_frozen = true WHERE member_id = $1', [memberId]);
+      // ── Master override ──
+      // Legitimate big sales happen (e.g. a full upgrade package). A Master
+      // posting the points is the approval: the transaction goes through,
+      // and an informational alert still goes to all Masters as an audit
+      // trail. Admin/Technician attempts below are always blocked.
+      if (req.user.role === 'Master') {
+        pool.query(
+          `SELECT username, telegram_chat_id FROM staff_users
+            WHERE role = 'Master' AND telegram_chat_id IS NOT NULL`
+        ).then(masters => {
+          const note =
+            `Large transaction notice\n\n` +
+            `Master "${req.user.username}" added ${numericPoints.toLocaleString()} points ` +
+            `to customer "${target.full_name}" (threshold: ${FRAUD_POINT_THRESHOLD.toLocaleString()}).\n\n` +
+            `This was allowed because a Master posted it. No action needed if this was you.`;
+          for (const m of masters.rows) {
+            sendTelegram(m.telegram_chat_id, note).catch(e => console.error('Large-tx notice send failed:', e.message));
+          }
+        }).catch(e => console.error('Large-tx notice lookup failed:', e.message));
+        console.warn(`FRAUD INTERCEPTOR: Master override — ${numericPoints} pts by "${req.user.username}" to member ${memberId} allowed.`);
+        // fall through to the normal points logic below
+      } else {
+        // Freeze the target, disable the offending (compromised) staff
+        // account, block, and alert Masters.
+        await pool.query('UPDATE members SET is_frozen = true WHERE member_id = $1', [memberId]);
 
-      // Disable the staff account that attempted it — but NEVER a Master
-      // (that could lock the owner out of their own shop). Kill their sessions
-      // so a compromised live session is booted immediately.
-      let staffDisabled = false;
-      if (req.user.role !== 'Master') {
+        // Kill their sessions so a compromised live session is booted immediately.
         await pool.query('UPDATE staff_users SET is_disabled = true WHERE id = $1', [req.user.id]);
         await pool.query('DELETE FROM sessions WHERE staff_id = $1', [req.user.id]);
-        staffDisabled = true;
+
+        // Priority alert to every linked Master (fire-and-forget; the block
+        // stands even if Telegram is down).
+        pool.query(
+          `SELECT username, telegram_chat_id FROM staff_users
+            WHERE role = 'Master' AND telegram_chat_id IS NOT NULL`
+        ).then(masters => {
+          const alert =
+            `SECURITY ALERT — Fraud Interceptor\n\n` +
+            `Staff "${req.user.username}" attempted to add ${numericPoints.toLocaleString()} points ` +
+            `to customer "${target.full_name}" in a single transaction (threshold: ${FRAUD_POINT_THRESHOLD.toLocaleString()}).\n\n` +
+            `The transaction was BLOCKED, the customer's account has been FROZEN, ` +
+            `and the staff account "${req.user.username}" has been DISABLED and logged out.\n\n` +
+            `If this was a legitimate sale: unfreeze the customer and re-enable the staff account from the dashboard, then post the points from a Master account.`;
+          for (const m of masters.rows) {
+            sendTelegram(m.telegram_chat_id, alert).catch(e => console.error('Fraud alert send failed:', e.message));
+          }
+        }).catch(e => console.error('Fraud alert lookup failed:', e.message));
+
+        console.warn(`FRAUD INTERCEPTOR: blocked ${numericPoints} pts by "${req.user.username}" to member ${memberId}; customer frozen, staff disabled.`);
+        return res.status(422).json({
+          error: `Blocked: single additions of ${FRAUD_POINT_THRESHOLD}+ points must be posted by a Master. The customer's account has been frozen, your account has been disabled, and Masters have been alerted.`,
+        });
       }
-
-      // Priority alert to every linked Master (fire-and-forget; the block
-      // stands even if Telegram is down).
-      pool.query(
-        `SELECT username, telegram_chat_id FROM staff_users
-          WHERE role = 'Master' AND telegram_chat_id IS NOT NULL`
-      ).then(masters => {
-        const alert =
-          `SECURITY ALERT — Fraud Interceptor\n\n` +
-          `Staff "${req.user.username}" attempted to add ${numericPoints.toLocaleString()} points ` +
-          `to customer "${target.full_name}" in a single transaction (threshold: ${FRAUD_POINT_THRESHOLD.toLocaleString()}).\n\n` +
-          `The transaction was BLOCKED and the customer's account has been FROZEN.\n` +
-          (staffDisabled
-            ? `The staff account "${req.user.username}" has been DISABLED and logged out.\n\n`
-            : `(Staff is a Master, so the account was not disabled.)\n\n`) +
-          `Review it, then unfreeze the customer and re-enable the staff account from the dashboard if this was legitimate.`;
-        for (const m of masters.rows) {
-          sendTelegram(m.telegram_chat_id, alert).catch(e => console.error('Fraud alert send failed:', e.message));
-        }
-      }).catch(e => console.error('Fraud alert lookup failed:', e.message));
-
-      console.warn(`FRAUD INTERCEPTOR: blocked ${numericPoints} pts by "${req.user.username}" to member ${memberId}; customer frozen${staffDisabled ? ', staff disabled' : ''}.`);
-      return res.status(422).json({
-        error: `Blocked: single additions of ${FRAUD_POINT_THRESHOLD}+ points trip the fraud interceptor. The customer's account has been frozen${staffDisabled ? ' and your account has been disabled' : ''}, and Masters have been alerted.`,
-      });
     }
   } catch (err) {
     console.error('POST /api/add-points interceptor error:', err.message);
