@@ -359,26 +359,49 @@ async function handleEodCommand(chatId) {
       SELECT (NOW() AT TIME ZONE 'Asia/Singapore')::date AS d
     )
     SELECT
+      -- Distinct physical cars that earned points today.
       (SELECT COUNT(DISTINCT t.vehicle_id) FROM point_transactions t, today
         WHERE t.points_added > 0 AND t.vehicle_id IS NOT NULL
           AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS cars_serviced,
+
+      -- Points issued today, excluding void/reject corrections.
       (SELECT COALESCE(SUM(t.points_added), 0) FROM point_transactions t, today
         WHERE t.points_added > 0
+          AND COALESCE(t.description, '') !~* '(void|reject)'
           AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS points_issued,
+
+      -- Points genuinely redeemed today, excluding void/reject/reverse corrections.
       (SELECT COALESCE(SUM(-t.points_added), 0) FROM point_transactions t, today
         WHERE t.points_added < 0
+          AND COALESCE(t.description, '') !~* '(void|reject|reverse)'
           AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS points_redeemed,
+
+      -- Customers who joined today.
       (SELECT COUNT(*) FROM members m, today
-        WHERE (m.date_joined AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS new_customers
+        WHERE (m.date_joined AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS new_customers,
+
+      -- Points issued today to members who are CURRENTLY frozen (quarantined).
+      (SELECT COALESCE(SUM(t.points_added), 0) FROM point_transactions t
+        JOIN members m ON m.member_id = t.member_id AND m.is_frozen = true, today
+        WHERE t.points_added > 0
+          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS flagged_points,
+
+      -- Correction actions today (void/reject/reverse in the description).
+      (SELECT COUNT(*) FROM point_transactions t, today
+        WHERE COALESCE(t.description, '') ~* '(void|reject|reverse)'
+          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS fraudulent_transactions
   `);
   const s = stats.rows[0];
-  const dateLabel = new Date().toLocaleDateString('en-SG', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'Asia/Singapore' });
+  const dateLabel = new Date().toLocaleDateString('en-SG', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Singapore' });
   await sendTelegram(chatId,
     `End-of-Day Report — ${dateLabel}\n\n` +
-    `Cars serviced: ${s.cars_serviced}\n` +
+    `Cars serviced: ${s.cars_serviced.toLocaleString()}\n` +
     `Points issued: ${s.points_issued.toLocaleString()}\n` +
     `Points redeemed: ${s.points_redeemed.toLocaleString()}\n` +
-    `New customers: ${s.new_customers}`);
+    `New customers: ${s.new_customers.toLocaleString()}\n\n` +
+    `⚠️ Security & Audits:\n` +
+    `Flagged points (frozen): ${s.flagged_points.toLocaleString()}\n` +
+    `Rejected/Voided actions: ${s.fraudulent_transactions.toLocaleString()}`);
 }
 
 // /queue — today's active services (cars worked on today, SG time). Read-only.
