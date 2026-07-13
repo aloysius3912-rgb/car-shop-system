@@ -133,6 +133,17 @@ async function ensureVehicleModel() {
   await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS original_points INT;`);
   await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;`);
   await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS edited_by INT REFERENCES staff_users(id);`);
+  // Full edit trail: one row per edit, so every change is attributable.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS point_edit_log (
+      id SERIAL PRIMARY KEY,
+      transaction_id INT REFERENCES point_transactions(transaction_id) ON DELETE CASCADE,
+      old_points INT NOT NULL,
+      new_points INT NOT NULL,
+      edited_by INT REFERENCES staff_users(id),
+      edited_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 
   // Backfill vehicles from every plate we already have on file.
   await pool.query(`
@@ -1760,6 +1771,12 @@ app.put('/api/transactions/:txId', async (req, res) => {
         WHERE transaction_id = $1`,
       [txId, newPoints, tx.points_added, req.user.id]
     );
+    // Full trail: one log row per edit.
+    await client.query(
+      `INSERT INTO point_edit_log (transaction_id, old_points, new_points, edited_by)
+       VALUES ($1, $2, $3, $4)`,
+      [txId, tx.points_added, newPoints, req.user.id]
+    );
 
     await client.query('COMMIT');
 
@@ -2101,7 +2118,18 @@ app.get('/api/transactions/:memberId', async (req, res) => {
       `SELECT t.transaction_id, t.points_added, t.description, t.transaction_date,
               t.quarantine_status, t.original_points, t.edited_at,
               u.username AS staff_name,
-              c.car_plate, c.car_model
+              c.car_plate, c.car_model,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                         'old', el.old_points,
+                         'new', el.new_points,
+                         'by', eu.username,
+                         'at', el.edited_at
+                       ) ORDER BY el.edited_at ASC)
+                  FROM point_edit_log el
+                  LEFT JOIN staff_users eu ON eu.id = el.edited_by
+                 WHERE el.transaction_id = t.transaction_id
+              ), '[]'::json) AS edits
          FROM point_transactions t
          LEFT JOIN staff_users u ON u.id = t.staff_id
          LEFT JOIN cars c ON c.car_id = t.car_id

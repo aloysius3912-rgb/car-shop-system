@@ -698,6 +698,7 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit
   const [editingId, setEditingId] = useState(null);
   const [editValue, setEditValue] = useState('');
   const [saving, setSaving] = useState(false);
+  const [trailOpenId, setTrailOpenId] = useState(null); // which tx's edit trail is expanded
 
   if (!isOpen) return null;
 
@@ -740,11 +741,13 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit
             const ageMinutes = (Date.now() - new Date(tx.transaction_date).getTime()) / 60000;
             const editable = canEdit && !tx.quarantine_status && ageMinutes <= EDIT_WINDOW_MINUTES;
             const isEditing = editingId === tx.transaction_id;
+            const edits = Array.isArray(tx.edits) ? tx.edits : [];
+            const trailOpen = trailOpenId === tx.transaction_id;
             return (
               <div key={tx.transaction_id} style={{
-                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                 background: theme.inputBg, border: `1px solid ${theme.border}`, borderRadius: 8, padding: '10px 14px', fontSize: 13,
               }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
                   <span style={{ color: theme.text }}>
                     {tx.description || 'No description'}
@@ -758,9 +761,12 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit
                       <span style={{ color: theme.textFaint, fontSize: 10, fontWeight: 700, letterSpacing: 1, marginLeft: 8, border: `1px solid ${theme.border}`, borderRadius: 5, padding: '1px 6px' }}>REJECTED</span>
                     )}
                     {tx.edited_at && (
-                      <span title={`Originally ${tx.original_points} pts`} style={{ color: theme.textFaint, fontSize: 10, fontWeight: 700, letterSpacing: 1, marginLeft: 8, border: `1px solid ${theme.border}`, borderRadius: 5, padding: '1px 6px' }}>
-                        EDITED{tx.original_points != null ? ` · was ${tx.original_points}` : ''}
-                      </span>
+                      <button
+                        onClick={() => setTrailOpenId(trailOpen ? null : tx.transaction_id)}
+                        title="Show edit history"
+                        style={{ color: theme.textFaint, fontSize: 10, fontWeight: 700, letterSpacing: 1, marginLeft: 8, border: `1px solid ${theme.border}`, borderRadius: 5, padding: '1px 6px', background: 'none', cursor: 'pointer', fontFamily: "'JetBrains Mono', monospace" }}>
+                        EDITED{edits.length > 1 ? ` ×${edits.length}` : ''} {trailOpen ? '▴' : '▾'}
+                      </button>
                     )}
                   </span>
                   <span style={{ color: theme.textFaint, fontSize: 11 }}>
@@ -794,6 +800,23 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit
                     </>
                   )}
                 </div>
+              </div>
+
+              {/* Edit trail: every change, oldest first */}
+              {trailOpen && (
+                <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px dashed ${theme.border}`, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {edits.length === 0 ? (
+                    <span style={{ fontSize: 11, color: theme.textFaint }}>
+                      Edited{tx.original_points != null ? ` — originally ${tx.original_points} pts` : ''} (detailed log unavailable for this entry).
+                    </span>
+                  ) : edits.map((e, i) => (
+                    <span key={i} style={{ fontSize: 11, color: theme.textFaint }}>
+                      {e.old} → <span style={{ color: theme.text }}>{e.new} pts</span>
+                      {e.by ? ` · by ${e.by}` : ''} · {formatDateTime(e.at)}
+                    </span>
+                  ))}
+                </div>
+              )}
               </div>
             );
           })}
@@ -1728,10 +1751,14 @@ export default function App() {
     socket.on('memberPhoneUpdated', ({ memberId, phone }) => {
       setMembers(prev => prev.map(m => m.member_id == memberId ? { ...m, phone } : m));
     });
-    socket.on('transactionEdited', ({ memberId, transactionId, points }) => {
-      setHistoryData(prev => prev[memberId]
-        ? { ...prev, [memberId]: prev[memberId].map(t => t.transaction_id === transactionId ? { ...t, points_added: points, edited_at: new Date().toISOString(), original_points: t.original_points ?? t.points_added } : t) }
-        : prev);
+    socket.on('transactionEdited', ({ memberId }) => {
+      setHistoryData(prev => {
+        if (!prev[memberId]) return prev;
+        apiFetch(`/api/transactions/${memberId}`)
+          .then(data => setHistoryData(p => ({ ...p, [memberId]: Array.isArray(data) ? data : p[memberId] })))
+          .catch(() => {});
+        return prev;
+      });
     });
     socket.on('memberDeleted', ({ memberId }) => setMembers(prev => prev.filter(m => m.member_id != memberId)));
     socket.on('carAdded', ({ memberId, car }) => {
@@ -1741,9 +1768,14 @@ export default function App() {
       setMembers(prev => prev.map(m => m.member_id === memberId ? { ...m, cars: (m.cars || []).filter(c => c.car_id !== carId) } : m));
     });
     socket.on('transactionAdded', ({ memberId, transaction }) => {
+      // The socket payload only carries raw IDs (no car plate / staff name),
+      // so refetch the joined history instead of prepending a bare row.
       setHistoryData(prev => {
         if (!prev[memberId]) return prev;
-        return { ...prev, [memberId]: [transaction, ...prev[memberId]] };
+        apiFetch(`/api/transactions/${memberId}`)
+          .then(data => setHistoryData(p => ({ ...p, [memberId]: Array.isArray(data) ? data : p[memberId] })))
+          .catch(() => {});
+        return { ...prev, [memberId]: [transaction, ...prev[memberId]] }; // instant, then replaced
       });
     });
     return () => {
