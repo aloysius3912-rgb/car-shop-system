@@ -2092,10 +2092,43 @@ app.post('/api/add-points', async (req, res) => {
     );
     const tx = txResult.rows[0];
 
-    // 4) QUARANTINE INTERCEPTOR: non-Master at/above their ceiling → the
-    // points stand, but the account locks until a Master reviews.
+    // 4) QUARANTINE INTERCEPTOR — three tripwires, all non-Master only.
+    //    The points stand, but the account locks until a Master reviews.
+    //
+    //  a) Single transaction at/above the poster's role ceiling.
+    //  b) VELOCITY, per customer: total added to THIS member in the last 24h
+    //     (including this tx) reaches the ceiling — catches structuring like
+    //     1,999 + 1,999 that slips under the single-tx check.
+    //  c) VELOCITY, per staff: this staff member's total issuance across ALL
+    //     customers in 24h reaches 3× their ceiling — catches spreading the
+    //     same trick across multiple accounts.
+    let quarantineReason = null;
+    if (req.user.role !== 'Master') {
+      if (shouldQuarantine) {
+        quarantineReason = `single transaction of ${numericPoints.toLocaleString()} pts is at/above their ${roleLimit.toLocaleString()}-pt limit`;
+      } else if (numericPoints > 0) {
+        const velQ = await client.query(
+          `SELECT
+             COALESCE(SUM(points_added) FILTER (WHERE member_id = $1), 0)::int AS member_24h,
+             COALESCE(SUM(points_added), 0)::int AS staff_24h
+           FROM point_transactions
+          WHERE staff_id = $2
+            AND points_added > 0
+            AND quarantine_status IS DISTINCT FROM 'rejected'
+            AND transaction_date > NOW() - INTERVAL '24 hours'`,
+          [memberId, req.user.id]
+        );
+        const { member_24h, staff_24h } = velQ.rows[0];
+        if (member_24h >= roleLimit) {
+          quarantineReason = `24-hour total to this customer reached ${member_24h.toLocaleString()} pts (limit ${roleLimit.toLocaleString()})`;
+        } else if (staff_24h >= roleLimit * 3) {
+          quarantineReason = `24-hour total issued by this staff member reached ${staff_24h.toLocaleString()} pts across all customers (limit ${(roleLimit * 3).toLocaleString()})`;
+        }
+      }
+    }
+
     let wasQuarantined = false;
-    if (shouldQuarantine && req.user.role !== 'Master') {
+    if (quarantineReason) {
       await client.query('UPDATE members SET is_frozen = true WHERE member_id = $1', [memberId]);
       await client.query(
         `UPDATE point_transactions SET quarantine_status = 'pending' WHERE transaction_id = $1`,
@@ -2123,7 +2156,8 @@ app.post('/api/add-points', async (req, res) => {
         const alert =
           `SECURITY ALERT — Quarantine Interceptor\n\n` +
           `Staff "${req.user.username}" (${req.user.role}) added ${numericPoints.toLocaleString()} points ` +
-          `to customer "${target.full_name}" — at/above their role limit of ${roleLimit.toLocaleString()}.\n\n` +
+          `to customer "${target.full_name}".\n\n` +
+          `Tripwire: ${quarantineReason}.\n\n` +
           `Transaction #${tx.transaction_id} was RECORDED and the customer's account is now FROZEN pending review.\n\n` +
           `Decide below, or from the customer's card on the dashboard.`;
         const buttons = {
@@ -2137,13 +2171,13 @@ app.post('/api/add-points', async (req, res) => {
         }
       }).catch(e => console.error('Quarantine alert lookup failed:', e.message));
 
-      console.warn(`QUARANTINE: tx #${tx.transaction_id} — ${numericPoints} pts by "${req.user.username}" (${req.user.role}, limit ${roleLimit}) to member ${memberId}; member frozen.`);
+      console.warn(`QUARANTINE: tx #${tx.transaction_id} — ${numericPoints} pts by "${req.user.username}" (${req.user.role}) to member ${memberId}; ${quarantineReason}; member frozen.`);
       return res.status(201).json({
         success: true,
         newTotal,
         transactionId: tx.transaction_id,
         quarantined: true,
-        warning: `Points recorded (transaction #${tx.transaction_id}), but this exceeds your ${roleLimit.toLocaleString()}-point limit — the customer's account is temporarily locked pending Master approval. Masters have been notified.`,
+        warning: `Points recorded (transaction #${tx.transaction_id}), but a fraud tripwire fired (${quarantineReason}) — the customer's account is temporarily locked pending Master approval. Masters have been notified.`,
       });
     }
 
