@@ -692,8 +692,40 @@ function CarsPanel({ member, theme, onCarAdded, onCarDeleted }) {
 }
 
 // ── History drawer ──
-function HistoryDrawer({ memberId, isOpen, transactions, loading, theme }) {
+const EDIT_WINDOW_MINUTES = 60;
+
+function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit, onEdited }) {
+  const [editingId, setEditingId] = useState(null);
+  const [editValue, setEditValue] = useState('');
+  const [saving, setSaving] = useState(false);
+
   if (!isOpen) return null;
+
+  const startEdit = (tx) => {
+    setEditingId(tx.transaction_id);
+    setEditValue(String(tx.points_added));
+  };
+
+  const saveEdit = async (tx) => {
+    const pts = parseInt(editValue, 10);
+    if (!Number.isFinite(pts) || pts === 0) { toast('Enter a valid points value.', 'warn'); return; }
+    if (pts === tx.points_added) { setEditingId(null); return; }
+    setSaving(true);
+    try {
+      await apiFetch(`/api/transactions/${tx.transaction_id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ points: pts }),
+      });
+      toast(`Transaction #${tx.transaction_id} corrected: ${tx.points_added} → ${pts} pts.`);
+      setEditingId(null);
+      onEdited && onEdited(memberId);
+    } catch (err) {
+      toast(`Edit failed: ${err.message}`, 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div style={{ width: '100%', marginTop: 14, paddingTop: 14, borderTop: `1px solid ${theme.border}`, animation: 'fadeIn 0.2s ease both' }}>
       <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 2, marginBottom: 10, textTransform: 'uppercase' }}>Transaction History</div>
@@ -705,12 +737,15 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme }) {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 220, overflowY: 'auto', paddingRight: 6 }}>
           {transactions.map(tx => {
             const positive = tx.points_added >= 0;
+            const ageMinutes = (Date.now() - new Date(tx.transaction_date).getTime()) / 60000;
+            const editable = canEdit && !tx.quarantine_status && ageMinutes <= EDIT_WINDOW_MINUTES;
+            const isEditing = editingId === tx.transaction_id;
             return (
               <div key={tx.transaction_id} style={{
                 display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                 background: theme.inputBg, border: `1px solid ${theme.border}`, borderRadius: 8, padding: '10px 14px', fontSize: 13,
               }}>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
                   <span style={{ color: theme.text }}>
                     {tx.description || 'No description'}
                     {tx.car_plate && (
@@ -722,14 +757,43 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme }) {
                     {tx.quarantine_status === 'rejected' && (
                       <span style={{ color: theme.textFaint, fontSize: 10, fontWeight: 700, letterSpacing: 1, marginLeft: 8, border: `1px solid ${theme.border}`, borderRadius: 5, padding: '1px 6px' }}>REJECTED</span>
                     )}
+                    {tx.edited_at && (
+                      <span title={`Originally ${tx.original_points} pts`} style={{ color: theme.textFaint, fontSize: 10, fontWeight: 700, letterSpacing: 1, marginLeft: 8, border: `1px solid ${theme.border}`, borderRadius: 5, padding: '1px 6px' }}>
+                        EDITED{tx.original_points != null ? ` · was ${tx.original_points}` : ''}
+                      </span>
+                    )}
                   </span>
                   <span style={{ color: theme.textFaint, fontSize: 11 }}>
                     {formatDateTime(tx.transaction_date)}{tx.staff_name ? ` · by ${tx.staff_name}` : ''}
                   </span>
                 </div>
-                <span style={{ color: positive ? '#10b981' : '#ef4444', fontWeight: 700, fontSize: 14, whiteSpace: 'nowrap', marginLeft: 12 }}>
-                  {positive ? '+' : ''}{tx.points_added} pts
-                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 12, whiteSpace: 'nowrap' }}>
+                  {isEditing ? (
+                    <>
+                      <input
+                        type="number" value={editValue} autoFocus disabled={saving}
+                        onChange={e => setEditValue(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') saveEdit(tx); if (e.key === 'Escape') setEditingId(null); }}
+                        style={inputStyle(theme, { width: 90, textAlign: 'center', padding: '6px 8px', fontSize: 13 })}
+                      />
+                      <button disabled={saving} onClick={() => saveEdit(tx)} style={btnStyle(theme.accent, theme.bg, { padding: '6px 12px', fontSize: 12 })}>
+                        {saving ? '…' : 'Save'}
+                      </button>
+                      <button disabled={saving} onClick={() => setEditingId(null)} style={btnStyle('#374151', '#fff', { padding: '6px 10px', fontSize: 12 })}>✕</button>
+                    </>
+                  ) : (
+                    <>
+                      <span style={{ color: positive ? '#10b981' : '#ef4444', fontWeight: 700, fontSize: 14 }}>
+                        {positive ? '+' : ''}{tx.points_added} pts
+                      </span>
+                      {editable && (
+                        <button onClick={() => startEdit(tx)} title={`Fix a typo within ${EDIT_WINDOW_MINUTES} minutes of posting`} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textDim, borderRadius: 6, padding: '3px 9px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>
+                          Edit
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
               </div>
             );
           })}
@@ -1600,6 +1664,7 @@ export default function App() {
   const [newName, setNewName] = useState('');
   const [newPlate, setNewPlate] = useState('');
   const [newModel, setNewModel] = useState('');
+  const [newPhone, setNewPhone] = useState('');
   const [adjustments, setAdjustments] = useState({});
   const [descriptions, setDescriptions] = useState({});
   const [searchQuery, setSearchQuery] = useState('');
@@ -1660,6 +1725,14 @@ export default function App() {
     socket.on('memberUnfrozen', ({ memberId }) => {
       setMembers(prev => prev.map(m => m.member_id == memberId ? { ...m, is_frozen: false } : m));
     });
+    socket.on('memberPhoneUpdated', ({ memberId, phone }) => {
+      setMembers(prev => prev.map(m => m.member_id == memberId ? { ...m, phone } : m));
+    });
+    socket.on('transactionEdited', ({ memberId, transactionId, points }) => {
+      setHistoryData(prev => prev[memberId]
+        ? { ...prev, [memberId]: prev[memberId].map(t => t.transaction_id === transactionId ? { ...t, points_added: points, edited_at: new Date().toISOString(), original_points: t.original_points ?? t.points_added } : t) }
+        : prev);
+    });
     socket.on('memberDeleted', ({ memberId }) => setMembers(prev => prev.filter(m => m.member_id != memberId)));
     socket.on('carAdded', ({ memberId, car }) => {
       setMembers(prev => prev.map(m => m.member_id === memberId ? { ...m, cars: [...(m.cars || []), car] } : m));
@@ -1676,7 +1749,7 @@ export default function App() {
     return () => {
       socket.off('connect'); socket.off('disconnect'); socket.off('connect_error');
       socket.off('pointsUpdated');
-      socket.off('memberAdded'); socket.off('memberDeleted'); socket.off('memberFrozen'); socket.off('memberUnfrozen');
+      socket.off('memberAdded'); socket.off('memberDeleted'); socket.off('memberFrozen'); socket.off('memberUnfrozen'); socket.off('memberPhoneUpdated'); socket.off('transactionEdited');
       socket.off('carAdded'); socket.off('carDeleted'); socket.off('transactionAdded');
       socket.disconnect();
     };
@@ -1687,10 +1760,10 @@ export default function App() {
     try {
       await apiFetch('/api/new-member', {
         method: 'POST',
-        body: JSON.stringify({ fullName: newName.trim(), carPlate: newPlate.trim().toUpperCase(), carModel: newModel.trim() }),
+        body: JSON.stringify({ fullName: newName.trim(), carPlate: newPlate.trim().toUpperCase(), carModel: newModel.trim(), phone: newPhone.trim() }),
       });
       toast(`${newName.trim()} registered!`);
-      setNewName(''); setNewPlate(''); setNewModel('');
+      setNewName(''); setNewPlate(''); setNewModel(''); setNewPhone('');
       setReturningInfo(null);
     } catch (err) {
       toast(`Registration failed: ${err.message}`, 'error');
@@ -1753,6 +1826,22 @@ export default function App() {
     }
   };
 
+  const handleEditPhone = async (member) => {
+    const input = window.prompt(`Contact number for ${member.full_name}:`, member.phone || '');
+    if (input === null) return; // cancelled
+    const phone = input.trim();
+    try {
+      await apiFetch(`/api/members/${member.member_id}/phone`, {
+        method: 'PUT',
+        body: JSON.stringify({ phone }),
+      });
+      setMembers(prev => prev.map(m => m.member_id === member.member_id ? { ...m, phone: phone || null } : m));
+      toast(phone ? `Contact saved for ${member.full_name}.` : `Contact removed for ${member.full_name}.`);
+    } catch (err) {
+      toast(`Could not save contact: ${err.message}`, 'error');
+    }
+  };
+
   const handleUnfreeze = async (memberId, name) => {
     try {
       await apiFetch(`/api/members/${memberId}/unfreeze`, { method: 'POST' });
@@ -1773,6 +1862,13 @@ export default function App() {
     } catch (err) {
       toast(`Delete failed: ${err.message}`, 'error');
     }
+  };
+
+  const refreshHistory = async (memberId) => {
+    try {
+      const data = await apiFetch(`/api/transactions/${memberId}`);
+      setHistoryData(prev => ({ ...prev, [memberId]: Array.isArray(data) ? data : [] }));
+    } catch { /* balance still updates via socket */ }
   };
 
   const toggleHistory = async (memberId) => {
@@ -1905,6 +2001,7 @@ export default function App() {
             <input type="text" placeholder="Customer name…" value={newName} onChange={e => setNewName(e.target.value)} required style={inputStyle(theme, { flex: '2 1 160px' })} />
             <input type="text" placeholder="Plate (e.g. SBA1234A)" value={newPlate} onChange={e => setNewPlate(e.target.value.toUpperCase())} style={inputStyle(theme, { flex: '1 1 130px', textTransform: 'uppercase' })} />
             <input type="text" placeholder="Car model (e.g. Tesla Model 3)" value={newModel} onChange={e => setNewModel(e.target.value)} style={inputStyle(theme, { flex: '2 1 180px' })} />
+            <input type="tel" placeholder="Contact no. (e.g. 9123 4567)" value={newPhone} onChange={e => setNewPhone(e.target.value)} style={inputStyle(theme, { flex: '1 1 150px' })} />
             <button type="submit" disabled={registering} style={{ ...btnStyle(theme.accent, theme.bg), flex: '0 0 auto', opacity: registering ? 0.6 : 1, display: 'flex', alignItems: 'center', gap: 8 }}>
               {registering ? <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} /> : '＋'}
               {registering ? 'Saving…' : 'Register'}
@@ -1983,6 +2080,16 @@ export default function App() {
                       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 8 }}>
                         {cars[0]?.car_model && <span style={{ fontSize: 12, color: theme.textDim }}>{cars[0].car_model}</span>}
                         <span style={{ fontSize: 12, color: theme.textFaint }}>Joined {formatDate(member.date_joined)}</span>
+                        <span style={{ fontSize: 12, color: theme.textFaint }}>
+                          {member.phone
+                            ? <>· <a href={`tel:${member.phone.replace(/\s+/g, '')}`} style={{ color: theme.accent, textDecoration: 'none' }}>{member.phone}</a></>
+                            : null}
+                          {can('can_add_member') && (
+                            <button onClick={() => handleEditPhone(member)} title={member.phone ? 'Edit contact number' : 'Add contact number'} style={{ background: 'none', border: 'none', color: theme.textFaint, cursor: 'pointer', fontFamily: "'JetBrains Mono', monospace", fontSize: 11, padding: '0 0 0 6px', textDecoration: 'underline' }}>
+                              {member.phone ? 'edit' : '+ contact'}
+                            </button>
+                          )}
+                        </span>
                       </div>
 
                       <div style={{ display: 'flex', alignItems: 'baseline', gap: 5 }}>
@@ -2057,6 +2164,8 @@ export default function App() {
                     transactions={historyData[member.member_id] || []}
                     loading={!!historyLoading[member.member_id]}
                     theme={theme}
+                    canEdit={can('can_add_points') || can('can_deduct_points')}
+                    onEdited={refreshHistory}
                   />
                 </div>
               );

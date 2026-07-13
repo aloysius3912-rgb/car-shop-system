@@ -127,6 +127,12 @@ async function ensureVehicleModel() {
   await pool.query(`ALTER TABLE staff_users ADD COLUMN IF NOT EXISTS is_disabled BOOLEAN DEFAULT false;`);
   // Quarantine review: 'pending' until a Master approves/rejects; NULL = normal tx.
   await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS quarantine_status TEXT;`);
+  // Contact number for reaching the customer.
+  await pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS phone VARCHAR(30);`);
+  // One-hour typo window: edits keep an audit trail of the original value.
+  await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS original_points INT;`);
+  await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;`);
+  await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS edited_by INT REFERENCES staff_users(id);`);
 
   // Backfill vehicles from every plate we already have on file.
   await pool.query(`
@@ -326,7 +332,7 @@ async function handleCustomerCommand(chatId, nameRaw) {
   const name = (nameRaw || '').trim();
   if (!name) { await sendTelegram(chatId, 'Usage: /customer David Lim'); return; }
   const r = await pool.query(
-    `SELECT m.member_id, m.full_name, m.total_points, m.date_joined
+    `SELECT m.member_id, m.full_name, m.total_points, m.date_joined, m.phone
        FROM members m
       WHERE m.deleted_at IS NULL AND m.full_name ILIKE '%' || $1 || '%'
       ORDER BY m.full_name ASC
@@ -347,7 +353,7 @@ async function handleCustomerCommand(chatId, nameRaw) {
       ? carsQ.rows.map(c => `${(c.car_plate || '(no plate)').toUpperCase()}${c.car_model ? ` (${c.car_model})` : ''}`).join(', ')
       : 'no cars on file';
     const joined = new Date(m.date_joined).toLocaleDateString('en-SG', { day: 'numeric', month: 'short', year: 'numeric' });
-    blocks.push(`${m.full_name}\nPoints: ${(Number(m.total_points) || 0).toLocaleString()}\nJoined: ${joined}\nCars: ${cars}`);
+    blocks.push(`${m.full_name}\nPoints: ${(Number(m.total_points) || 0).toLocaleString()}\nJoined: ${joined}\nContact: ${m.phone || 'not on file'}\nCars: ${cars}`);
   }
   await sendTelegram(chatId, blocks.join('\n\n———\n\n'));
 }
@@ -1369,7 +1375,7 @@ app.get('/api/members', async (req, res) => {
 
 // ── Register a new member with their first car ──
 app.post('/api/new-member', requirePermission('can_add_member'), async (req, res) => {
-  const { fullName, carPlate, carModel } = req.body;
+  const { fullName, carPlate, carModel, phone } = req.body;
   if (!fullName || !fullName.trim()) {
     return res.status(400).json({ error: 'Full name is required' });
   }
@@ -1390,8 +1396,8 @@ app.post('/api/new-member', requirePermission('can_add_member'), async (req, res
 
     // Insert member
     const memberResult = await pool.query(
-      'INSERT INTO members (full_name, total_points, date_joined) VALUES ($1, 0, NOW()) RETURNING *',
-      [fullName.trim()]
+      'INSERT INTO members (full_name, total_points, date_joined, phone) VALUES ($1, 0, NOW(), $2) RETURNING *',
+      [fullName.trim(), phone && phone.trim() ? phone.trim() : null]
     );
     const newMember = memberResult.rows[0];
 
@@ -1509,6 +1515,143 @@ app.post('/api/staff/:id/enable', requireMaster, async (req, res) => {
   } catch (err) {
     console.error('POST /api/staff/:id/enable error:', err.message);
     res.status(500).json({ error: 'Could not re-enable the staff account. Please try again.' });
+  }
+});
+
+// ── Update a member's contact number ──
+app.put('/api/members/:id/phone', requirePermission('can_add_member'), async (req, res) => {
+  const { id } = req.params;
+  const { phone } = req.body || {};
+  try {
+    const result = await pool.query(
+      'UPDATE members SET phone = $2 WHERE member_id = $1 RETURNING member_id, phone',
+      [id, phone && phone.trim() ? phone.trim() : null]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Member not found' });
+    io.emit('memberPhoneUpdated', { memberId: result.rows[0].member_id, phone: result.rows[0].phone });
+    res.json({ success: true, phone: result.rows[0].phone });
+  } catch (err) {
+    console.error('PUT /api/members/:id/phone error:', err.message);
+    res.status(500).json({ error: 'Could not update the contact number.' });
+  }
+});
+
+// ── One-hour typo window: edit a transaction's points ──
+// Rules: within 60 minutes of posting; by the original poster or Admin/Master;
+// not on quarantined/reviewed transactions; the member must not be frozen;
+// balance can't go below zero; and the new value can't cross the editor's
+// role limit (no editing 300 → 3000 to sneak past the quarantine).
+const EDIT_WINDOW_MINUTES = 60;
+
+app.put('/api/transactions/:txId', async (req, res) => {
+  const { txId } = req.params;
+  const newPoints = parseInt(req.body?.points, 10);
+  if (!Number.isFinite(newPoints) || newPoints === 0) {
+    return res.status(400).json({ error: 'Enter a valid non-zero points value.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const txQ = await client.query(
+      `SELECT t.member_id, t.points_added, t.transaction_date, t.staff_id, t.quarantine_status,
+              m.is_frozen
+         FROM point_transactions t
+         JOIN members m ON m.member_id = t.member_id
+        WHERE t.transaction_id = $1
+        FOR UPDATE OF t, m`,
+      [txId]
+    );
+    if (txQ.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Transaction not found.' });
+    }
+    const tx = txQ.rows[0];
+
+    // Window check.
+    const ageMinutes = (Date.now() - new Date(tx.transaction_date).getTime()) / 60000;
+    if (ageMinutes > EDIT_WINDOW_MINUTES) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: `Transactions can only be edited within ${EDIT_WINDOW_MINUTES} minutes of posting. Use a correcting redemption instead.` });
+    }
+
+    // Who may edit: the original poster, or Admin/Master.
+    const isAdminPlus = req.user.role === 'Admin' || req.user.role === 'Master';
+    if (tx.staff_id !== req.user.id && !isAdminPlus) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Only the staff member who posted this (or an Admin/Master) can edit it.' });
+    }
+
+    // Sign flips are corrections of intent, not typos — keep it simple.
+    if (Math.sign(newPoints) !== Math.sign(tx.points_added)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'An edit cannot change an earn into a redemption (or vice versa).' });
+    }
+
+    // Permission by sign, same as posting.
+    const perm = newPoints < 0 ? 'can_deduct_points' : 'can_add_points';
+    if (!can(req.user, perm)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: `You do not have permission to ${newPoints < 0 ? 'deduct' : 'add'} points.` });
+    }
+
+    // No editing quarantined/reviewed transactions, or frozen members.
+    if (tx.quarantine_status) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({ error: 'This transaction is under (or has been through) Master review and cannot be edited.' });
+    }
+    if (tx.is_frozen) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({ error: 'This account is FROZEN. A Master must unfreeze it first.' });
+    }
+
+    // Role-limit guard: an edit can't cross the editor's ceiling.
+    const roleLimit = ROLE_POINT_LIMITS[req.user.role] ?? FRAUD_POINT_THRESHOLD;
+    if (newPoints >= roleLimit) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({ error: `Edits at/above your ${roleLimit.toLocaleString()}-point limit aren't allowed — ask a Master to post it.` });
+    }
+
+    // Apply the delta atomically, never letting the balance drop below zero.
+    const delta = newPoints - tx.points_added;
+    const upd = await client.query(
+      `UPDATE members
+          SET total_points = COALESCE(total_points, 0) + $1
+        WHERE member_id = $2
+          AND COALESCE(total_points, 0) + $1 >= 0
+        RETURNING total_points`,
+      [delta, tx.member_id]
+    );
+    if (upd.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'That edit would take the member below zero points.' });
+    }
+
+    // Update the record, preserving the original value once (first edit only).
+    await client.query(
+      `UPDATE point_transactions
+          SET points_added = $2,
+              original_points = COALESCE(original_points, $3),
+              edited_at = NOW(),
+              edited_by = $4
+        WHERE transaction_id = $1`,
+      [txId, newPoints, tx.points_added, req.user.id]
+    );
+
+    await client.query('COMMIT');
+
+    const newTotal = upd.rows[0].total_points;
+    io.emit('pointsUpdated', { memberId: tx.member_id, newTotal });
+    io.emit('transactionEdited', { memberId: tx.member_id, transactionId: Number(txId), points: newPoints });
+    console.log(`Transaction #${txId} edited by ${req.user.username}: ${tx.points_added} → ${newPoints} pts.`);
+    res.json({ success: true, newTotal, points: newPoints });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('PUT /api/transactions/:txId error:', err.message);
+    res.status(500).json({ error: 'Could not edit the transaction. Please try again.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1822,7 +1965,7 @@ app.get('/api/transactions/:memberId', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT t.transaction_id, t.points_added, t.description, t.transaction_date,
-              t.quarantine_status,
+              t.quarantine_status, t.original_points, t.edited_at,
               u.username AS staff_name,
               c.car_plate, c.car_model
          FROM point_transactions t
