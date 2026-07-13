@@ -66,9 +66,13 @@ async function ensureAuthTables() {
       token TEXT PRIMARY KEY,
       staff_id INT REFERENCES staff_users(id) ON DELETE CASCADE,
       role TEXT,
-      expires_at TIMESTAMP NOT NULL
+      expires_at TIMESTAMP NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  // Migration for existing installs (pre-existing rows get the deploy time,
+  // which self-corrects as those 12-hour sessions expire).
+  await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();`);
   // Telegram 2FA: chat id per staff member + a pending link code.
   await pool.query(`
     ALTER TABLE staff_users
@@ -624,6 +628,34 @@ async function handleBackupCommand(chatId) {
     `Staff: ${s.staff}`);
 }
 
+// /floor_check — who is live on the dashboard right now. Read-only. Master only.
+// A "live" staff member is anyone holding an unexpired session token.
+async function handleFloorCheckCommand(chatId) {
+  const r = await pool.query(
+    `SELECT DISTINCT ON (u.id) u.username, u.role, s.created_at
+       FROM sessions s
+       JOIN staff_users u ON u.id = s.staff_id
+      WHERE s.expires_at > NOW()
+      ORDER BY u.id, s.created_at DESC`
+  );
+  if (r.rows.length === 0) {
+    await sendTelegram(chatId, 'No one is currently logged in to the dashboard.');
+    return;
+  }
+  const rank = { Master: 0, Admin: 1, Technician: 2 };
+  const rows = r.rows.sort((a, b) => (rank[a.role] ?? 3) - (rank[b.role] ?? 3) || a.username.localeCompare(b.username));
+  const sgNow = new Date().toLocaleDateString('en-SG', { timeZone: 'Asia/Singapore' });
+  const lines = rows.map(s => {
+    const d = new Date(s.created_at);
+    const sameDay = d.toLocaleDateString('en-SG', { timeZone: 'Asia/Singapore' }) === sgNow;
+    const since = sameDay
+      ? d.toLocaleTimeString('en-SG', { hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Singapore' })
+      : d.toLocaleString('en-SG', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Singapore' });
+    return `🟢 ${s.username} (${s.role}) — Active since ${since}`;
+  });
+  await sendTelegram(chatId, `Live on Dashboard (${rows.length}):\n\n${lines.join('\n')}`);
+}
+
 // Route a message from a verified staff member, gated by their exact role.
 async function handleStaffMessage(chatId, staff, text) {
   const parts = text.trim().split(/\s+/);
@@ -689,6 +721,14 @@ async function handleStaffMessage(chatId, staff, text) {
       await handleAuditCommand(chatId, arg);
       return;
 
+    case '/floor_check':
+      if (!isMaster) {
+        await sendTelegram(chatId, 'Only the Master can use /floor_check.');
+        return;
+      }
+      await handleFloorCheckCommand(chatId);
+      return;
+
     case '/backup':
       if (!isMaster) {
         await sendTelegram(chatId, 'Only the Master can use /backup.');
@@ -744,6 +784,7 @@ async function handleStaffMessage(chatId, staff, text) {
         lines.push('/eod, /week, /month — reports' + (isMaster ? '' : ' (if enabled by Master)'));
       }
       if (isMaster) {
+        lines.push('/floor_check — who is logged in right now');
         lines.push('/staff — all staff + 2FA status');
         lines.push('/audit <username> — last 10 point actions by a staff member');
         lines.push('/backup — row-count health check');
