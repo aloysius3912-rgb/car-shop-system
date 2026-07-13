@@ -480,8 +480,10 @@ async function handleFindCommand(chatId, partialRaw) {
   await sendTelegram(chatId, `Plates matching "${partial}" (${r.rows.length}):\n\n${lines.join('\n')}\n\nUse /lookup <plate> for full history.`);
 }
 
-// /queue — today's active services (cars worked on today, SG time). Read-only.
-async function handleQueueCommand(chatId) {
+// /today — cars already serviced today (SG time). Read-only.
+// (Renamed from /queue: without a check-in or booking system this is a
+// rear-view list of completed work, not a live waiting queue.)
+async function handleTodayCommand(chatId) {
   const r = await pool.query(`
     SELECT v.plate, v.car_model,
            MAX(t.transaction_date) AS last_activity,
@@ -669,8 +671,12 @@ async function handleStaffMessage(chatId, staff, text) {
       await handleLookupCommand(chatId, arg);
       return;
 
-    case '/queue':
-      await handleQueueCommand(chatId);
+    case '/today':
+      await handleTodayCommand(chatId);
+      return;
+
+    case '/queue': // old name — point people at the new one
+      await sendTelegram(chatId, 'This command is now /today (it lists cars already serviced today).');
       return;
 
     case '/whois':
@@ -774,7 +780,7 @@ async function handleStaffMessage(chatId, staff, text) {
         `Staff commands (${staff.role}):`,
         '/lookup <plate> — service history of a car',
         '/find <partial> — fuzzy plate search (e.g. /find SJL2)',
-        '/queue — vehicles serviced today',
+        '/today — vehicles serviced today',
         '/whois <plate> — quick owner/car context',
       ];
       if (isAdminPlus) {
