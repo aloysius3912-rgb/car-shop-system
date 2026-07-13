@@ -217,16 +217,36 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const CHALLENGE_TTL_MINUTES = 5;
 const CHALLENGE_MAX_ATTEMPTS = 5;
 
-async function sendTelegram(chatId, text) {
+async function sendTelegram(chatId, text, replyMarkup = null) {
+  const body = { chat_id: chatId, text };
+  if (replyMarkup) body.reply_markup = replyMarkup;
   const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Telegram send failed (${res.status}): ${body}`);
+    const resBody = await res.text().catch(() => '');
+    throw new Error(`Telegram send failed (${res.status}): ${resBody}`);
   }
+}
+
+// Acknowledge a button tap (clears the loading spinner on the user's phone).
+async function answerTelegramCallback(callbackQueryId, text = '') {
+  await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ callback_query_id: callbackQueryId, text }),
+  }).catch(e => console.error('answerCallbackQuery failed:', e.message));
+}
+
+// Rewrite an existing bot message (used to strike the buttons after a decision).
+async function editTelegramMessage(chatId, messageId, text) {
+  await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text }),
+  }).catch(e => console.error('editMessageText failed:', e.message));
 }
 
 // ── Customer-facing bot ──
@@ -358,56 +378,91 @@ async function handleCustomerCommand(chatId, nameRaw) {
   await sendTelegram(chatId, blocks.join('\n\n———\n\n'));
 }
 
-// /eod — today's numbers in Singapore time (Admin only when toggled; Master always).
-async function handleEodCommand(chatId) {
+// Shared stats over a window of N days (1 = today only), SG timezone.
+async function fetchPeriodStats(days) {
   const stats = await pool.query(`
-    WITH today AS (
-      SELECT (NOW() AT TIME ZONE 'Asia/Singapore')::date AS d
+    WITH win AS (
+      SELECT ((NOW() AT TIME ZONE 'Asia/Singapore')::date - ($1::int - 1)) AS start_d
     )
     SELECT
-      -- Distinct physical cars that earned points today.
-      (SELECT COUNT(DISTINCT t.vehicle_id) FROM point_transactions t, today
+      (SELECT COUNT(DISTINCT t.vehicle_id) FROM point_transactions t, win
         WHERE t.points_added > 0 AND t.vehicle_id IS NOT NULL
-          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS cars_serviced,
+          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date >= win.start_d)::int AS cars_serviced,
 
-      -- Points issued today, excluding void/reject corrections.
-      (SELECT COALESCE(SUM(t.points_added), 0) FROM point_transactions t, today
+      (SELECT COALESCE(SUM(t.points_added), 0) FROM point_transactions t, win
         WHERE t.points_added > 0
           AND COALESCE(t.description, '') !~* '(void|reject)'
-          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS points_issued,
+          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date >= win.start_d)::int AS points_issued,
 
-      -- Points genuinely redeemed today, excluding void/reject/reverse corrections.
-      (SELECT COALESCE(SUM(-t.points_added), 0) FROM point_transactions t, today
+      (SELECT COALESCE(SUM(-t.points_added), 0) FROM point_transactions t, win
         WHERE t.points_added < 0
           AND COALESCE(t.description, '') !~* '(void|reject|reverse)'
-          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS points_redeemed,
+          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date >= win.start_d)::int AS points_redeemed,
 
-      -- Customers who joined today.
-      (SELECT COUNT(*) FROM members m, today
-        WHERE (m.date_joined AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS new_customers,
+      (SELECT COUNT(*) FROM members m, win
+        WHERE (m.date_joined AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date >= win.start_d)::int AS new_customers,
 
-      -- Points issued today to members who are CURRENTLY frozen (quarantined).
       (SELECT COALESCE(SUM(t.points_added), 0) FROM point_transactions t
-        JOIN members m ON m.member_id = t.member_id AND m.is_frozen = true, today
+        JOIN members m ON m.member_id = t.member_id AND m.is_frozen = true, win
         WHERE t.points_added > 0
-          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS flagged_points,
+          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date >= win.start_d)::int AS flagged_points,
 
-      -- Correction actions today (void/reject/reverse in the description).
-      (SELECT COUNT(*) FROM point_transactions t, today
+      (SELECT COUNT(*) FROM point_transactions t, win
         WHERE COALESCE(t.description, '') ~* '(void|reject|reverse)'
-          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date = today.d)::int AS fraudulent_transactions
-  `);
-  const s = stats.rows[0];
-  const dateLabel = new Date().toLocaleDateString('en-SG', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Singapore' });
-  await sendTelegram(chatId,
-    `End-of-Day Report — ${dateLabel}\n\n` +
+          AND (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date >= win.start_d)::int AS fraudulent_transactions
+  `, [days]);
+  return stats.rows[0];
+}
+
+function formatStatsMessage(title, s) {
+  return (
+    `${title}\n\n` +
     `Cars serviced: ${s.cars_serviced.toLocaleString()}\n` +
     `Points issued: ${s.points_issued.toLocaleString()}\n` +
     `Points redeemed: ${s.points_redeemed.toLocaleString()}\n` +
     `New customers: ${s.new_customers.toLocaleString()}\n\n` +
     `⚠️ Security & Audits:\n` +
     `Flagged points (frozen): ${s.flagged_points.toLocaleString()}\n` +
-    `Rejected/Voided actions: ${s.fraudulent_transactions.toLocaleString()}`);
+    `Rejected/Voided actions: ${s.fraudulent_transactions.toLocaleString()}`
+  );
+}
+
+// /eod — today's numbers (Admin only when toggled; Master always).
+async function handleEodCommand(chatId) {
+  const s = await fetchPeriodStats(1);
+  const dateLabel = new Date().toLocaleDateString('en-SG', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Singapore' });
+  await sendTelegram(chatId, formatStatsMessage(`End-of-Day Report — ${dateLabel}`, s));
+}
+
+// /week and /month — same stats over rolling 7- and 30-day windows.
+async function handlePeriodCommand(chatId, days, label) {
+  const s = await fetchPeriodStats(days);
+  await sendTelegram(chatId, formatStatsMessage(`${label} Report — last ${days} days`, s));
+}
+
+// /find <partial> — fuzzy plate search for when only part of a plate is known.
+async function handleFindCommand(chatId, partialRaw) {
+  const partial = (partialRaw || '').trim().toUpperCase();
+  if (partial.length < 2) { await sendTelegram(chatId, 'Usage: /find SJL2 (at least 2 characters)'); return; }
+  const r = await pool.query(
+    `SELECT v.plate, v.car_model,
+            m.full_name AS owner,
+            (SELECT COUNT(*)::int FROM point_transactions t WHERE t.vehicle_id = v.vehicle_id) AS service_count
+       FROM vehicles v
+       LEFT JOIN cars c ON c.vehicle_id = v.vehicle_id
+       LEFT JOIN members m ON m.member_id = c.member_id AND m.deleted_at IS NULL
+      WHERE UPPER(v.plate) LIKE '%' || $1 || '%'
+      ORDER BY v.plate ASC
+      LIMIT 8`,
+    [partial]
+  );
+  if (r.rows.length === 0) {
+    await sendTelegram(chatId, `No plates matching "${partial}".`);
+    return;
+  }
+  const lines = r.rows.map(v =>
+    `• ${v.plate}${v.car_model ? ` (${v.car_model})` : ''} — ${v.owner || 'no active owner'} — ${v.service_count} service${v.service_count !== 1 ? 's' : ''}`);
+  await sendTelegram(chatId, `Plates matching "${partial}" (${r.rows.length}):\n\n${lines.join('\n')}\n\nUse /lookup <plate> for full history.`);
 }
 
 // /queue — today's active services (cars worked on today, SG time). Read-only.
@@ -579,6 +634,10 @@ async function handleStaffMessage(chatId, staff, text) {
       await handleWhoisCommand(chatId, arg);
       return;
 
+    case '/find':
+      await handleFindCommand(chatId, arg);
+      return;
+
     case '/customer':
       if (!isAdminPlus) {
         await sendTelegram(chatId, 'You do not have permission to use /customer.');
@@ -627,19 +686,23 @@ async function handleStaffMessage(chatId, staff, text) {
       await handleBackupCommand(chatId);
       return;
 
-    case '/eod': {
+    case '/eod':
+    case '/week':
+    case '/month': {
       if (!isAdminPlus) {
-        await sendTelegram(chatId, 'You do not have permission to use /eod.');
+        await sendTelegram(chatId, `You do not have permission to use ${cmd}.`);
         return;
       }
       if (!isMaster) {
         const allowed = (await getSetting('admins_receive_eod_reports')) === 'true';
         if (!allowed) {
-          await sendTelegram(chatId, 'EOD reports for Admins are currently disabled by the Master.');
+          await sendTelegram(chatId, 'Reports for Admins are currently disabled by the Master.');
           return;
         }
       }
-      await handleEodCommand(chatId);
+      if (cmd === '/eod') await handleEodCommand(chatId);
+      else if (cmd === '/week') await handlePeriodCommand(chatId, 7, 'Weekly');
+      else await handlePeriodCommand(chatId, 30, 'Monthly');
       return;
     }
 
@@ -659,6 +722,7 @@ async function handleStaffMessage(chatId, staff, text) {
       const lines = [
         `Staff commands (${staff.role}):`,
         '/lookup <plate> — service history of a car',
+        '/find <partial> — fuzzy plate search (e.g. /find SJL2)',
         '/queue — vehicles serviced today',
         '/whois <plate> — quick owner/car context',
       ];
@@ -666,7 +730,7 @@ async function handleStaffMessage(chatId, staff, text) {
         lines.push('/customer <name> — customer profile, points, cars');
         lines.push('/leaderboard — top 5 customers by points');
         lines.push('/tx <plate> — last 3 transactions with IDs');
-        lines.push('/eod — end-of-day report' + (isMaster ? '' : ' (if enabled by Master)'));
+        lines.push('/eod, /week, /month — reports' + (isMaster ? '' : ' (if enabled by Master)'));
       }
       if (isMaster) {
         lines.push('/staff — all staff + 2FA status');
@@ -685,6 +749,64 @@ async function handleStaffMessage(chatId, staff, text) {
 
 // Process one incoming Telegram update (message).
 async function processTelegramUpdate(update) {
+  // ── Inline button taps (quarantine Approve/Reject) ──
+  if (update.callback_query) {
+    const cb = update.callback_query;
+    const chatId = cb.message?.chat?.id;
+    const data = cb.data || '';
+    try {
+      // Bouncer: only a chat linked to a MASTER may action these buttons.
+      const staffQ = await pool.query(
+        `SELECT id, username, role FROM staff_users WHERE telegram_chat_id = $1`,
+        [chatId]
+      );
+      const staff = staffQ.rows[0];
+      if (!staff || staff.role !== 'Master') {
+        await answerTelegramCallback(cb.id, 'Only a Master can decide this.');
+        return;
+      }
+
+      const m = data.match(/^q:(approve|reject):(\d+)$/);
+      if (!m) {
+        await answerTelegramCallback(cb.id, 'Unknown action.');
+        return;
+      }
+      const [, action, txId] = m;
+      const result = await reviewQuarantinedTransaction(txId, action, staff);
+
+      if (!result.ok) {
+        // Usually "already decided" — tell the tapper and strike the buttons.
+        await answerTelegramCallback(cb.id, result.error);
+        await editTelegramMessage(chatId, cb.message.message_id,
+          `${cb.message.text}\n\n— ${result.error}`);
+        return;
+      }
+
+      const verdict = action === 'approve'
+        ? `APPROVED by ${staff.username} — points stand${result.unfrozen ? ', account unfrozen' : ''}.`
+        : `REJECTED by ${staff.username} — ${Number(result.pts).toLocaleString()} pts reversed${result.disabledStaff ? `, staff "${result.disabledStaff}" disabled` : ''}${result.unfrozen ? ', account unfrozen' : ''}.`;
+
+      await answerTelegramCallback(cb.id, action === 'approve' ? 'Approved.' : 'Rejected.');
+      // Strike the buttons on THIS Master's copy and record the verdict.
+      await editTelegramMessage(chatId, cb.message.message_id,
+        `${cb.message.text}\n\n— ${verdict}`);
+      // Tell the other Masters it's been handled (their buttons will now no-op safely).
+      pool.query(
+        `SELECT telegram_chat_id FROM staff_users
+          WHERE role = 'Master' AND telegram_chat_id IS NOT NULL AND telegram_chat_id <> $1`,
+        [chatId]
+      ).then(others => {
+        for (const o of others.rows) {
+          sendTelegram(o.telegram_chat_id, `Quarantined transaction #${txId}: ${verdict}`).catch(() => {});
+        }
+      }).catch(() => {});
+    } catch (e) {
+      console.error('Callback handling error:', e.message);
+      await answerTelegramCallback(cb.id, 'Something went wrong — try the dashboard.');
+    }
+    return;
+  }
+
   const msg = update.message;
   if (!msg || !msg.text) return;
   const chatId = msg.chat.id;
@@ -1677,51 +1799,45 @@ app.get('/api/members/:id/quarantine', requireMaster, async (req, res) => {
   }
 });
 
-app.post('/api/transactions/:txId/approve', requireMaster, async (req, res) => {
-  const { txId } = req.params;
+// ── Shared quarantine decision logic ──
+// Used by BOTH the dashboard routes and the Telegram inline buttons, so the
+// two paths can never drift. `actor` = { id, username } of the deciding Master.
+// Returns { ok, error?, unfrozen?, disabledStaff?, newTotal?, pts?, memberName? }.
+async function reviewQuarantinedTransaction(txId, action, actor) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const txQ = await client.query(
-      `UPDATE point_transactions SET quarantine_status = 'approved'
-        WHERE transaction_id = $1 AND quarantine_status = 'pending'
-        RETURNING member_id, points_added`,
-      [txId]
-    );
-    if (txQ.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'No pending transaction with that ID.' });
+
+    if (action === 'approve') {
+      const txQ = await client.query(
+        `UPDATE point_transactions SET quarantine_status = 'approved'
+          WHERE transaction_id = $1 AND quarantine_status = 'pending'
+          RETURNING member_id, points_added`,
+        [txId]
+      );
+      if (txQ.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return { ok: false, error: 'No pending transaction with that ID.' };
+      }
+      const memberId = txQ.rows[0].member_id;
+      const nameQ = await client.query('SELECT full_name FROM members WHERE member_id = $1', [memberId]);
+
+      const pending = await client.query(
+        `SELECT 1 FROM point_transactions WHERE member_id = $1 AND quarantine_status = 'pending' LIMIT 1`,
+        [memberId]
+      );
+      const unfrozen = pending.rows.length === 0;
+      if (unfrozen) {
+        await client.query('UPDATE members SET is_frozen = false WHERE member_id = $1', [memberId]);
+      }
+      await client.query('COMMIT');
+
+      if (unfrozen) io.emit('memberUnfrozen', { memberId });
+      console.log(`Quarantine: tx #${txId} APPROVED by ${actor.username}.`);
+      return { ok: true, unfrozen, pts: txQ.rows[0].points_added, memberName: nameQ.rows[0]?.full_name || null };
     }
-    const memberId = txQ.rows[0].member_id;
 
-    // Unfreeze only when nothing else is pending for this member.
-    const pending = await client.query(
-      `SELECT 1 FROM point_transactions WHERE member_id = $1 AND quarantine_status = 'pending' LIMIT 1`,
-      [memberId]
-    );
-    const unfrozen = pending.rows.length === 0;
-    if (unfrozen) {
-      await client.query('UPDATE members SET is_frozen = false WHERE member_id = $1', [memberId]);
-    }
-    await client.query('COMMIT');
-
-    if (unfrozen) io.emit('memberUnfrozen', { memberId });
-    console.log(`Quarantine: tx #${txId} APPROVED by ${req.user.username}.`);
-    res.json({ success: true, unfrozen });
-  } catch (err) {
-    await client.query('ROLLBACK').catch(() => {});
-    console.error('POST /api/transactions/:txId/approve error:', err.message);
-    res.status(500).json({ error: 'Could not approve the transaction.' });
-  } finally {
-    client.release();
-  }
-});
-
-app.post('/api/transactions/:txId/reject', requireMaster, async (req, res) => {
-  const { txId } = req.params;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
+    // action === 'reject'
     const txQ = await client.query(
       `UPDATE point_transactions SET quarantine_status = 'rejected'
         WHERE transaction_id = $1 AND quarantine_status = 'pending'
@@ -1730,7 +1846,7 @@ app.post('/api/transactions/:txId/reject', requireMaster, async (req, res) => {
     );
     if (txQ.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'No pending transaction with that ID.' });
+      return { ok: false, error: 'No pending transaction with that ID.' };
     }
     const { member_id: memberId, points_added: pts, staff_id: offenderId } = txQ.rows[0];
 
@@ -1748,7 +1864,7 @@ app.post('/api/transactions/:txId/reject', requireMaster, async (req, res) => {
     await client.query(
       `INSERT INTO point_transactions (member_id, points_added, description, staff_id, served_member_name)
        VALUES ($1, $2, $3, $4, $5)`,
-      [memberId, -pts, `Rejected quarantined transaction #${txId}`, req.user.id, upd.rows[0]?.full_name || null]
+      [memberId, -pts, `Rejected quarantined transaction #${txId}`, actor.id, upd.rows[0]?.full_name || null]
     );
 
     // A rejection means the Master judged this transaction illegitimate — so
@@ -1790,7 +1906,7 @@ app.post('/api/transactions/:txId/reject', requireMaster, async (req, res) => {
       ).then(masters => {
         const note =
           `Quarantine follow-up\n\n` +
-          `Master "${req.user.username}" REJECTED transaction #${txId} (${pts.toLocaleString()} pts reversed).\n\n` +
+          `Master "${actor.username}" REJECTED transaction #${txId} (${pts.toLocaleString()} pts reversed).\n\n` +
           `The staff account "${disabledStaff}" that posted it has been DISABLED and logged out. ` +
           `Speak with them, then re-enable the account from Manage Staff if appropriate.`;
         for (const m of masters.rows) {
@@ -1799,15 +1915,27 @@ app.post('/api/transactions/:txId/reject', requireMaster, async (req, res) => {
       }).catch(e => console.error('Reject notice lookup failed:', e.message));
     }
 
-    console.log(`Quarantine: tx #${txId} REJECTED by ${req.user.username}; ${pts} pts reversed${disabledStaff ? `; staff "${disabledStaff}" disabled` : ''}.`);
-    res.json({ success: true, newTotal, unfrozen, disabledStaff });
+    console.log(`Quarantine: tx #${txId} REJECTED by ${actor.username}; ${pts} pts reversed${disabledStaff ? `; staff "${disabledStaff}" disabled` : ''}.`);
+    return { ok: true, unfrozen, disabledStaff, newTotal, pts, memberName: upd.rows[0]?.full_name || null };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('POST /api/transactions/:txId/reject error:', err.message);
-    res.status(500).json({ error: 'Could not reject the transaction.' });
+    console.error(`reviewQuarantinedTransaction(${action}) error:`, err.message);
+    return { ok: false, error: `Could not ${action} the transaction.` };
   } finally {
     client.release();
   }
+}
+
+app.post('/api/transactions/:txId/approve', requireMaster, async (req, res) => {
+  const result = await reviewQuarantinedTransaction(req.params.txId, 'approve', req.user);
+  if (!result.ok) return res.status(result.error.includes('No pending') ? 404 : 500).json({ error: result.error });
+  res.json({ success: true, unfrozen: result.unfrozen });
+});
+
+app.post('/api/transactions/:txId/reject', requireMaster, async (req, res) => {
+  const result = await reviewQuarantinedTransaction(req.params.txId, 'reject', req.user);
+  if (!result.ok) return res.status(result.error.includes('No pending') ? 404 : 500).json({ error: result.error });
+  res.json({ success: true, newTotal: result.newTotal, unfrozen: result.unfrozen, disabledStaff: result.disabledStaff });
 });
 
 // ── Fraud interceptor: per-role single-transaction point ceilings ──
@@ -1933,9 +2061,15 @@ app.post('/api/add-points', async (req, res) => {
           `Staff "${req.user.username}" (${req.user.role}) added ${numericPoints.toLocaleString()} points ` +
           `to customer "${target.full_name}" — at/above their role limit of ${roleLimit.toLocaleString()}.\n\n` +
           `Transaction #${tx.transaction_id} was RECORDED and the customer's account is now FROZEN pending review.\n\n` +
-          `On the dashboard, open the customer's card and Approve (keep the points) or Reject (reverse them) the pending transaction.`;
+          `Decide below, or from the customer's card on the dashboard.`;
+        const buttons = {
+          inline_keyboard: [[
+            { text: `Approve #${tx.transaction_id}`, callback_data: `q:approve:${tx.transaction_id}` },
+            { text: `Reject #${tx.transaction_id}`, callback_data: `q:reject:${tx.transaction_id}` },
+          ]],
+        };
         for (const m of masters.rows) {
-          sendTelegram(m.telegram_chat_id, alert).catch(e => console.error('Quarantine alert send failed:', e.message));
+          sendTelegram(m.telegram_chat_id, alert, buttons).catch(e => console.error('Quarantine alert send failed:', e.message));
         }
       }).catch(e => console.error('Quarantine alert lookup failed:', e.message));
 
