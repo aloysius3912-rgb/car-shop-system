@@ -1554,11 +1554,46 @@ app.get('/api/members', async (req, res) => {
 });
 
 // ── Register a new member with their first car ──
+// ── Phone validation: Singapore (+65) & Malaysia (+60), no SMS/OTP ──
+// Strips spaces/dashes, enforces exact digit lengths. Phone stays OPTIONAL:
+// an empty value is allowed (stored as NULL). To make it REQUIRED at
+// registration, reject a null phoneCheck.value in the route (see comment there).
+function validatePhoneNumber(raw) {
+  if (raw === undefined || raw === null) return { ok: true, value: null };
+  const cleaned = String(raw).replace(/[\s-]/g, ''); // strip spaces & dashes only
+  if (cleaned === '') return { ok: true, value: null };
+
+  let country, core;
+  if (cleaned.startsWith('+65')) { country = 'SG'; core = cleaned.slice(3); }
+  else if (cleaned.startsWith('+60')) { country = 'MY'; core = cleaned.slice(3); }
+  else if (cleaned.startsWith('+')) {
+    return { ok: false, error: 'Only Singapore (+65) and Malaysia (+60) numbers are accepted.' };
+  } else if (/^[89]/.test(cleaned)) { country = 'SG'; core = cleaned; } // bare SG mobile
+  else {
+    return { ok: false, error: 'Unrecognised number. Enter a Singapore number starting with 8 or 9, or include a +65 / +60 country code.' };
+  }
+
+  if (!/^\d+$/.test(core)) {
+    return { ok: false, error: 'Phone number may only contain digits (plus an optional +65 / +60 code, spaces, and dashes).' };
+  }
+  if (country === 'SG' && core.length !== 8) {
+    return { ok: false, error: 'Singapore numbers must be exactly 8 digits (excluding the +65 country code).' };
+  }
+  if (country === 'MY' && core.length !== 9 && core.length !== 10) {
+    return { ok: false, error: 'Malaysia numbers must be 9 or 10 digits after the +60 country code.' };
+  }
+  return { ok: true, value: cleaned }; // store the cleaned +code form so tel: links work
+}
+
 app.post('/api/new-member', requirePermission('can_add_member'), async (req, res) => {
   const { fullName, carPlate, carModel, phone } = req.body;
   if (!fullName || !fullName.trim()) {
     return res.status(400).json({ error: 'Full name is required' });
   }
+  const phoneCheck = validatePhoneNumber(phone);
+  if (!phoneCheck.ok) return res.status(400).json({ error: phoneCheck.error });
+  // To require a phone at registration, uncomment:
+  // if (!phoneCheck.value) return res.status(400).json({ error: 'A contact number is required.' });
   try {
     // Check for duplicate plate in cars table
     const normalizedPlate = carPlate ? carPlate.trim().toUpperCase() : null;
@@ -1577,7 +1612,7 @@ app.post('/api/new-member', requirePermission('can_add_member'), async (req, res
     // Insert member
     const memberResult = await pool.query(
       'INSERT INTO members (full_name, total_points, date_joined, phone) VALUES ($1, 0, NOW(), $2) RETURNING *',
-      [fullName.trim(), phone && phone.trim() ? phone.trim() : null]
+      [fullName.trim(), phoneCheck.value]
     );
     const newMember = memberResult.rows[0];
 
@@ -1702,10 +1737,12 @@ app.post('/api/staff/:id/enable', requireMaster, async (req, res) => {
 app.put('/api/members/:id/phone', requirePermission('can_add_member'), async (req, res) => {
   const { id } = req.params;
   const { phone } = req.body || {};
+  const phoneCheck = validatePhoneNumber(phone);
+  if (!phoneCheck.ok) return res.status(400).json({ error: phoneCheck.error });
   try {
     const result = await pool.query(
       'UPDATE members SET phone = $2 WHERE member_id = $1 RETURNING member_id, phone',
-      [id, phone && phone.trim() ? phone.trim() : null]
+      [id, phoneCheck.value]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Member not found' });
     io.emit('memberPhoneUpdated', { memberId: result.rows[0].member_id, phone: result.rows[0].phone });
@@ -2109,6 +2146,10 @@ app.post('/api/add-points', async (req, res) => {
       } else if (numericPoints > 0) {
         const velQ = await client.query(
           `SELECT
+             COALESCE(SUM(points_added) FILTER (
+               WHERE member_id = $1
+                 AND transaction_date > NOW() - INTERVAL '5 minutes'
+             ), 0)::int AS member_5min,
              COALESCE(SUM(points_added) FILTER (WHERE member_id = $1), 0)::int AS member_24h,
              COALESCE(SUM(points_added), 0)::int AS staff_24h
            FROM point_transactions
@@ -2118,8 +2159,15 @@ app.post('/api/add-points', async (req, res) => {
             AND transaction_date > NOW() - INTERVAL '24 hours'`,
           [memberId, req.user.id]
         );
-        const { member_24h, staff_24h } = velQ.rows[0];
-        if (member_24h >= roleLimit) {
+        const { member_5min, member_24h, staff_24h } = velQ.rows[0];
+        // (a5) Anti-structuring: rapid accumulation to ONE customer inside 5 minutes.
+        //      This tx is already inserted, so member_5min includes the current
+        //      numericPoints — i.e. it IS "(prior 5-min sum) + numericPoints".
+        //      Flat FRAUD_POINT_THRESHOLD so the 2,000 single-tx rule can't be
+        //      bypassed by any non-Master role via small repeats (e.g. 1,999 + 1,999).
+        if (member_5min >= FRAUD_POINT_THRESHOLD) {
+          quarantineReason = `Accumulated points over 5 minutes — ${member_5min.toLocaleString()} pts added to this customer within a 5-minute window (limit ${FRAUD_POINT_THRESHOLD.toLocaleString()})`;
+        } else if (member_24h >= roleLimit) {
           quarantineReason = `24-hour total to this customer reached ${member_24h.toLocaleString()} pts (limit ${roleLimit.toLocaleString()})`;
         } else if (staff_24h >= roleLimit * 3) {
           quarantineReason = `24-hour total issued by this staff member reached ${staff_24h.toLocaleString()} pts across all customers (limit ${(roleLimit * 3).toLocaleString()})`;
