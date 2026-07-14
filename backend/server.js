@@ -2133,44 +2133,33 @@ app.post('/api/add-points', async (req, res) => {
     //    The points stand, but the account locks until a Master reviews.
     //
     //  a) Single transaction at/above the poster's role ceiling.
-    //  b) VELOCITY, per customer: total added to THIS member in the last 24h
-    //     (including this tx) reaches the ceiling — catches structuring like
+    //  b) VELOCITY (5-min anti-structuring): total added to THIS customer by
+    //     this staff member within the last 5 minutes (including this tx)
+    //     reaches FRAUD_POINT_THRESHOLD — catches rapid structuring like
     //     1,999 + 1,999 that slips under the single-tx check.
-    //  c) VELOCITY, per staff: this staff member's total issuance across ALL
-    //     customers in 24h reaches 3× their ceiling — catches spreading the
-    //     same trick across multiple accounts.
     let quarantineReason = null;
     if (req.user.role !== 'Master') {
       if (shouldQuarantine) {
         quarantineReason = `single transaction of ${numericPoints.toLocaleString()} pts is at/above their ${roleLimit.toLocaleString()}-pt limit`;
       } else if (numericPoints > 0) {
+        // (b) Anti-structuring: rapid accumulation to ONE customer inside 5 minutes.
+        //     This tx is already inserted, so member_5min includes the current
+        //     numericPoints — i.e. it IS "(prior 5-min sum) + numericPoints".
+        //     Flat FRAUD_POINT_THRESHOLD so the 2,000 single-tx rule can't be
+        //     bypassed by any non-Master role via small repeats (e.g. 1,999 + 1,999).
         const velQ = await client.query(
-          `SELECT
-             COALESCE(SUM(points_added) FILTER (
-               WHERE member_id = $1
-                 AND transaction_date > NOW() - INTERVAL '5 minutes'
-             ), 0)::int AS member_5min,
-             COALESCE(SUM(points_added) FILTER (WHERE member_id = $1), 0)::int AS member_24h,
-             COALESCE(SUM(points_added), 0)::int AS staff_24h
-           FROM point_transactions
-          WHERE staff_id = $2
-            AND points_added > 0
-            AND quarantine_status IS DISTINCT FROM 'rejected'
-            AND transaction_date > NOW() - INTERVAL '24 hours'`,
+          `SELECT COALESCE(SUM(points_added), 0)::int AS member_5min
+             FROM point_transactions
+            WHERE staff_id = $2
+              AND member_id = $1
+              AND points_added > 0
+              AND quarantine_status IS DISTINCT FROM 'rejected'
+              AND transaction_date > NOW() - INTERVAL '5 minutes'`,
           [memberId, req.user.id]
         );
-        const { member_5min, member_24h, staff_24h } = velQ.rows[0];
-        // (a5) Anti-structuring: rapid accumulation to ONE customer inside 5 minutes.
-        //      This tx is already inserted, so member_5min includes the current
-        //      numericPoints — i.e. it IS "(prior 5-min sum) + numericPoints".
-        //      Flat FRAUD_POINT_THRESHOLD so the 2,000 single-tx rule can't be
-        //      bypassed by any non-Master role via small repeats (e.g. 1,999 + 1,999).
+        const { member_5min } = velQ.rows[0];
         if (member_5min >= FRAUD_POINT_THRESHOLD) {
           quarantineReason = `Accumulated points over 5 minutes — ${member_5min.toLocaleString()} pts added to this customer within a 5-minute window (limit ${FRAUD_POINT_THRESHOLD.toLocaleString()})`;
-        } else if (member_24h >= roleLimit) {
-          quarantineReason = `24-hour total to this customer reached ${member_24h.toLocaleString()} pts (limit ${roleLimit.toLocaleString()})`;
-        } else if (staff_24h >= roleLimit * 3) {
-          quarantineReason = `24-hour total issued by this staff member reached ${staff_24h.toLocaleString()} pts across all customers (limit ${(roleLimit * 3).toLocaleString()})`;
         }
       }
     }
