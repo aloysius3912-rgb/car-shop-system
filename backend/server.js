@@ -220,6 +220,23 @@ async function ensureOpsTables() {
   // sure the column allows NULL (harmless no-op if it already does).
   await pool.query(`ALTER TABLE point_transactions ALTER COLUMN staff_id DROP NOT NULL;`)
     .catch(e => console.warn('staff_id nullability check skipped:', e.message));
+  // Track who soft-deleted a member (for the /trash_bin oversight command).
+  await pool.query(`ALTER TABLE members ADD COLUMN IF NOT EXISTS deleted_by TEXT;`);
+  // Backfill deleted_by for members already in the trash, using the newest
+  // DELETE_MEMBER audit entry for each (no-op once every row is populated).
+  await pool.query(`
+    UPDATE members m
+       SET deleted_by = a.username
+      FROM (
+        SELECT DISTINCT ON (target_id) target_id, username
+          FROM system_audit_logs
+         WHERE action_type = 'DELETE_MEMBER'
+         ORDER BY target_id, created_at DESC
+      ) a
+     WHERE m.member_id::text = a.target_id
+       AND m.deleted_at IS NOT NULL
+       AND m.deleted_by IS NULL
+  `).catch(e => console.warn('deleted_by backfill skipped:', e.message));
 }
 ensureOpsTables().catch(err => console.error('Ops tables setup failed:', err.message));
 
@@ -702,6 +719,130 @@ async function handleFloorCheckCommand(chatId) {
   await sendTelegram(chatId, `Live on Dashboard (${rows.length}):\n\n${lines.join('\n')}`);
 }
 
+// Format a timestamp as "Today 4:00 PM" / "Yesterday 11:00 AM" / "3 Jul 4:00 PM"
+// in Singapore time — used by the auditor commands.
+function sgRelativeDateTime(dateStr) {
+  const d = new Date(dateStr);
+  const opts = { timeZone: 'Asia/Singapore' };
+  const now = new Date();
+  const dayStr = d.toLocaleDateString('en-SG', opts);
+  const todayStr = now.toLocaleDateString('en-SG', opts);
+  const yestStr = new Date(now.getTime() - 24 * 3600 * 1000).toLocaleDateString('en-SG', opts);
+  const time = d.toLocaleTimeString('en-SG', { hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Singapore' });
+  let label;
+  if (dayStr === todayStr) label = 'Today';
+  else if (dayStr === yestStr) label = 'Yesterday';
+  else label = d.toLocaleDateString('en-SG', { day: 'numeric', month: 'short', timeZone: 'Asia/Singapore' });
+  return `${label} ${time}`;
+}
+
+// /trending — inventory radar: what accessories moved in the last 7 days.
+// Groups earning (points_added > 0) descriptions with light fuzzy normalisation
+// so "Dashcam Bundle" and "dashcam bundle install" count together. Admin+.
+async function handleTrendingCommand(chatId) {
+  const r = await pool.query(
+    `SELECT description
+       FROM point_transactions
+      WHERE transaction_date > NOW() - INTERVAL '7 days'
+        AND points_added > 0
+        AND description IS NOT NULL AND TRIM(description) <> ''`
+  );
+  // Descriptions that aren't accessories — don't let them pollute the radar.
+  const IGNORE = new Set(['manual adjustment', 'adjustment', 'service', 'top up', 'topup']);
+  const FILLER = /\b(install(ation|ed|s)?|fitting|fitted|setup|set up|done|service|job|for|the|a|x\d+)\b/g;
+  const counts = new Map();  // key -> { label, n }
+  for (const row of r.rows) {
+    const raw = row.description.trim();
+    let key = raw.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')   // drop punctuation
+      .replace(FILLER, ' ')            // strip filler words
+      .replace(/\s+/g, ' ')            // collapse spaces
+      .trim();
+    if (!key || IGNORE.has(key) || key.startsWith('system')) continue;
+    const label = key.replace(/\b\w/g, c => c.toUpperCase()); // Title Case
+    const cur = counts.get(key) || { label, n: 0 };
+    cur.n += 1;
+    counts.set(key, cur);
+  }
+  const top = [...counts.values()].sort((a, b) => b.n - a.n).slice(0, 5);
+  if (top.length === 0) {
+    await sendTelegram(chatId, '📈 No accessory installs logged in the last 7 days.');
+    return;
+  }
+  const lines = top.map((t, i) => `${i + 1}. ${t.label} (${t.n} install${t.n === 1 ? '' : 's'})`);
+  await sendTelegram(chatId, `📈 Top Accessories This Week:\n${lines.join('\n')}`);
+}
+
+// /whales — top 3 customers by points SPENT (redeemed) in the last 30 days.
+// Excludes system expiry and void/reject/reverse entries. Admin+.
+async function handleWhalesCommand(chatId) {
+  const r = await pool.query(
+    `SELECT m.full_name, SUM(-t.points_added)::int AS spent
+       FROM point_transactions t
+       JOIN members m ON m.member_id = t.member_id
+      WHERE t.transaction_date > NOW() - INTERVAL '30 days'
+        AND t.points_added < 0
+        AND m.deleted_at IS NULL
+        AND COALESCE(t.description,'') NOT ILIKE 'System:%'
+        AND COALESCE(t.description,'') NOT ILIKE '%void%'
+        AND COALESCE(t.description,'') NOT ILIKE '%reject%'
+        AND COALESCE(t.description,'') NOT ILIKE '%reverse%'
+      GROUP BY m.member_id, m.full_name
+      HAVING SUM(-t.points_added) > 0
+      ORDER BY spent DESC
+      LIMIT 3`
+  );
+  if (r.rows.length === 0) {
+    await sendTelegram(chatId, '👑 No point redemptions in the last 30 days yet.');
+    return;
+  }
+  const lines = r.rows.map((m, i) => `${i + 1}. ${m.full_name} — ${(Number(m.spent) || 0).toLocaleString()} pts`);
+  await sendTelegram(chatId, `👑 30-Day VIPs:\n${lines.join('\n')}`);
+}
+
+// /voided — mistake tracker: transactions in the last 48h whose description
+// mentions void/reject/reverse, with who did it and their role. Master only.
+async function handleVoidedCommand(chatId) {
+  const r = await pool.query(
+    `SELECT t.transaction_date, t.description, u.username, u.role
+       FROM point_transactions t
+       LEFT JOIN staff_users u ON u.id = t.staff_id
+      WHERE t.transaction_date > NOW() - INTERVAL '48 hours'
+        AND (t.description ILIKE '%void%' OR t.description ILIKE '%reject%' OR t.description ILIKE '%reverse%')
+      ORDER BY t.transaction_date DESC
+      LIMIT 25`
+  );
+  if (r.rows.length === 0) {
+    await sendTelegram(chatId, '⚠️ No voided/reversed transactions in the last 48 hours.');
+    return;
+  }
+  const lines = r.rows.map(t => {
+    const who = t.username ? `${t.username} (${t.role})` : 'system';
+    return `• ${sgRelativeDateTime(t.transaction_date)}: '${t.description}' by ${who}.`;
+  });
+  await sendTelegram(chatId, `⚠️ Recent Voids:\n${lines.join('\n')}`);
+}
+
+// /trash_bin — deletion log: members in 30-day soft-delete, who deleted them,
+// and how long until permanent purge. Master only.
+async function handleTrashBinCommand(chatId) {
+  const r = await pool.query(
+    `SELECT full_name, deleted_by,
+            GREATEST(0, 30 - EXTRACT(DAY FROM NOW() - deleted_at))::int AS days_left
+       FROM members
+      WHERE deleted_at IS NOT NULL
+      ORDER BY deleted_at ASC`
+  );
+  if (r.rows.length === 0) {
+    await sendTelegram(chatId, '🗑️ The trash is empty — no accounts pending deletion.');
+    return;
+  }
+  const lines = r.rows.map(m =>
+    `• ${m.full_name} (Deleted by ${m.deleted_by || 'unknown'} - ${m.days_left} day${m.days_left === 1 ? '' : 's'} left)`
+  );
+  await sendTelegram(chatId, `🗑️ Accounts pending permanent deletion:\n${lines.join('\n')}`);
+}
+
 // Route a message from a verified staff member, gated by their exact role.
 async function handleStaffMessage(chatId, staff, text) {
   const parts = text.trim().split(/\s+/);
@@ -818,6 +959,38 @@ async function handleStaffMessage(chatId, staff, text) {
       return;
     }
 
+    case '/trending':
+      if (!isAdminPlus) {
+        await sendTelegram(chatId, 'You do not have permission to use /trending.');
+        return;
+      }
+      await handleTrendingCommand(chatId);
+      return;
+
+    case '/whales':
+      if (!isAdminPlus) {
+        await sendTelegram(chatId, 'You do not have permission to use /whales.');
+        return;
+      }
+      await handleWhalesCommand(chatId);
+      return;
+
+    case '/voided':
+      if (!isMaster) {
+        await sendTelegram(chatId, 'Only the Master can use /voided.');
+        return;
+      }
+      await handleVoidedCommand(chatId);
+      return;
+
+    case '/trash_bin':
+      if (!isMaster) {
+        await sendTelegram(chatId, 'Only the Master can use /trash_bin.');
+        return;
+      }
+      await handleTrashBinCommand(chatId);
+      return;
+
     case '/start':
     case '/help': {
       const lines = [
@@ -831,12 +1004,16 @@ async function handleStaffMessage(chatId, staff, text) {
         lines.push('/customer <name> — customer profile, points, cars');
         lines.push('/leaderboard — top 5 customers by points');
         lines.push('/tx <plate> — last 3 transactions with IDs');
+        lines.push('/trending — top accessories installed this week');
+        lines.push('/whales — top 3 spenders (last 30 days)');
         lines.push('/eod, /week, /month — reports' + (isMaster ? '' : ' (if enabled by Master)'));
       }
       if (isMaster) {
         lines.push('/floor_check — who is logged in right now');
         lines.push('/staff — all staff + 2FA status');
         lines.push('/audit <username> — last 10 point actions by a staff member');
+        lines.push('/voided — void/reject/reverse entries (last 48h)');
+        lines.push('/trash_bin — members pending permanent deletion');
         lines.push('/backup — row-count health check');
         lines.push('/toggle_reports — enable/disable Admin EOD reports');
       }
@@ -2745,7 +2922,7 @@ app.get('/api/car-history/:plate', async (req, res) => {
 app.delete('/api/delete-member/:id', requirePermission('can_delete_member'), async (req, res) => {
   const memberId = req.params.id;
   try {
-    await pool.query('UPDATE members SET deleted_at = NOW() WHERE member_id = $1', [memberId]);
+    await pool.query('UPDATE members SET deleted_at = NOW(), deleted_by = $2 WHERE member_id = $1', [memberId, req.user.username]);
     io.emit('memberDeleted', { memberId: parseInt(memberId) });
     await auditLog(req, 'DELETE_MEMBER', memberId, 'moved to trash (soft delete)');
     res.json({ success: true });
