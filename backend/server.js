@@ -5,6 +5,12 @@ const { Pool } = require('pg');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const { z } = require('zod');
+// node-cron is optional: if it isn't installed we fall back to a setInterval
+// scheduler so the point-expiry job still runs. (Run: npm install node-cron)
+let cron = null;
+try { cron = require('node-cron'); }
+catch { console.warn('node-cron not installed — using setInterval fallback for the daily expiry job. Run: npm install node-cron'); }
 
 const app = express();
 
@@ -178,6 +184,44 @@ async function ensureVehicleModel() {
   console.log('Vehicle model ready.');
 }
 ensureVehicleModel().catch(err => console.error('Vehicle model setup failed:', err.message));
+
+// ── Operational tables: Master audit trail + idempotency keys ──
+// system_audit_logs: an append-only record of every sensitive non-point action
+//   (member/car/staff deletes, staff changes, settings) — who, what, when.
+// idempotency_keys: dedupe accidental double-submits (spotty shop Wi-Fi / double
+//   taps). A client sends a per-submission UUID; a repeat within the window is
+//   ignored and the first response is replayed.
+async function ensureOpsTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS system_audit_logs (
+      id          SERIAL PRIMARY KEY,
+      staff_id    INT,
+      username    TEXT,
+      action_type TEXT NOT NULL,
+      target_id   TEXT,
+      detail      TEXT,
+      ip          TEXT,
+      created_at  TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS system_audit_logs_created_idx ON system_audit_logs (created_at DESC);`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS idempotency_keys (
+      idempotency_key TEXT PRIMARY KEY,
+      staff_id        INT,
+      route           TEXT,
+      status_code     INT,
+      response        JSONB,
+      created_at      TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log('Ops tables ready (audit log + idempotency).');
+  // The expiry engine records system transactions with no staff_id, so make
+  // sure the column allows NULL (harmless no-op if it already does).
+  await pool.query(`ALTER TABLE point_transactions ALTER COLUMN staff_id DROP NOT NULL;`)
+    .catch(e => console.warn('staff_id nullability check skipped:', e.message));
+}
+ensureOpsTables().catch(err => console.error('Ops tables setup failed:', err.message));
 
 // Find the physical vehicle for a plate, creating it if this plate is new.
 // `db` can be the pool or a transaction client.
@@ -1015,6 +1059,247 @@ async function purgeOldTrash() {
 setInterval(purgeOldTrash, 60 * 60 * 1000);
 purgeOldTrash();
 
+// ════════════════════════════════════════════════════════════════════════
+//  Audit trail helpers
+// ════════════════════════════════════════════════════════════════════════
+// Record a sensitive action against the acting staff member. Fire-and-forget:
+// a logging failure must never break the underlying operation.
+async function auditLog(req, actionType, targetId, detail = null) {
+  try {
+    const ip = req?.headers?.['x-forwarded-for']?.split(',')[0].trim() || req?.ip || null;
+    await pool.query(
+      `INSERT INTO system_audit_logs (staff_id, username, action_type, target_id, detail, ip)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [req?.user?.id || null, req?.user?.username || null, actionType,
+       targetId != null ? String(targetId) : null, detail, ip]
+    );
+  } catch (e) { console.error('Audit log failed:', e.message); }
+}
+// System-initiated audit entry (no request context — e.g. the expiry cron).
+async function auditSystem(actionType, targetId, detail = null) {
+  try {
+    await pool.query(
+      `INSERT INTO system_audit_logs (staff_id, username, action_type, target_id, detail)
+       VALUES (NULL, 'SYSTEM', $1, $2, $3)`,
+      [actionType, targetId != null ? String(targetId) : null, detail]
+    );
+  } catch (e) { console.error('System audit log failed:', e.message); }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Telegram → all Masters
+// ════════════════════════════════════════════════════════════════════════
+async function getMasters() {
+  const r = await pool.query(
+    `SELECT username, telegram_chat_id FROM staff_users
+      WHERE role = 'Master' AND telegram_chat_id IS NOT NULL`
+  );
+  return r.rows;
+}
+async function notifyMasters(text, replyMarkup = null) {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  try {
+    const masters = await getMasters();
+    for (const m of masters) {
+      sendTelegram(m.telegram_chat_id, text, replyMarkup)
+        .catch(e => console.error('notifyMasters send failed:', e.message));
+    }
+  } catch (e) { console.error('notifyMasters lookup failed:', e.message); }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Idempotency keys (double-submit protection)
+// ════════════════════════════════════════════════════════════════════════
+const IDEMPOTENCY_WINDOW_MS = 10 * 1000; // replay window for an identical key
+
+// Reserve a key before doing the work. Returns:
+//   { reserved: true }                          → first time; proceed
+//   { replay: true, statusCode, response }      → duplicate; return this instead
+async function reserveIdempotencyKey(key, staffId, route) {
+  const ins = await pool.query(
+    `INSERT INTO idempotency_keys (idempotency_key, staff_id, route)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (idempotency_key) DO NOTHING
+     RETURNING idempotency_key`,
+    [key, staffId, route]
+  );
+  if (ins.rowCount === 1) return { reserved: true };
+
+  // Key already exists — a duplicate submission.
+  const ex = await pool.query(
+    'SELECT status_code, response, created_at FROM idempotency_keys WHERE idempotency_key = $1',
+    [key]
+  );
+  const row = ex.rows[0];
+  const ageMs = row ? Date.now() - new Date(row.created_at).getTime() : Infinity;
+  if (row && ageMs <= IDEMPOTENCY_WINDOW_MS) {
+    if (row.response) return { replay: true, statusCode: row.status_code || 200, response: row.response };
+    // First request is still in flight — tell the duplicate we've got it.
+    return {
+      replay: true, statusCode: 202,
+      response: { success: true, duplicate: true, message: 'Duplicate submission ignored — the first one is still processing.' },
+    };
+  }
+  // Stale key (older than the window): reclaim it for this fresh request.
+  await pool.query('DELETE FROM idempotency_keys WHERE idempotency_key = $1', [key]);
+  await pool.query(
+    `INSERT INTO idempotency_keys (idempotency_key, staff_id, route)
+     VALUES ($1, $2, $3) ON CONFLICT (idempotency_key) DO NOTHING`,
+    [key, staffId, route]
+  );
+  return { reserved: true };
+}
+// Store the final response so a duplicate within the window replays it exactly.
+async function finalizeIdempotencyKey(key, statusCode, response) {
+  try {
+    await pool.query(
+      'UPDATE idempotency_keys SET status_code = $2, response = $3 WHERE idempotency_key = $1',
+      [key, statusCode, JSON.stringify(response)]
+    );
+  } catch (e) { console.error('Idempotency finalize failed:', e.message); }
+}
+// Release a reserved key when the request failed (so a real retry can proceed).
+async function releaseIdempotencyKey(key) {
+  try { await pool.query('DELETE FROM idempotency_keys WHERE idempotency_key = $1', [key]); }
+  catch (e) { console.error('Idempotency release failed:', e.message); }
+}
+// Housekeeping: drop keys older than an hour (they're well past the window).
+setInterval(() => {
+  pool.query("DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '1 hour'").catch(() => {});
+}, 60 * 60 * 1000);
+
+// ════════════════════════════════════════════════════════════════════════
+//  Point-expiration engine (loyalty-liability cleanup)
+// ════════════════════════════════════════════════════════════════════════
+// Outstanding loyalty points are a financial liability. Points expire after
+// 12 months of ZERO shop activity (any transaction — earn or redeem — counts
+// as activity). Runs daily at 02:00 Asia/Singapore.
+const EXPIRY_DAYS = 365;
+const EXPIRY_WARNING_DAYS = 30; // heads-up window before points lapse
+
+// Clear balances for members inactive > EXPIRY_DAYS, logging each as a
+// "System: 12-Month Expiry" transaction so the paper trail stays intact.
+async function expireStalePoints() {
+  const stale = await pool.query(
+    `SELECT m.member_id, m.full_name, m.total_points
+       FROM members m
+      WHERE m.deleted_at IS NULL
+        AND COALESCE(m.is_frozen, false) = false
+        AND COALESCE(m.total_points, 0) > 0
+        AND COALESCE(
+              (SELECT MAX(t.transaction_date) FROM point_transactions t WHERE t.member_id = m.member_id),
+              m.date_joined
+            ) < NOW() - ($1 || ' days')::interval`,
+    [EXPIRY_DAYS]
+  );
+
+  let expiredCount = 0, pointsCleared = 0;
+  const client = await pool.connect();
+  try {
+    for (const m of stale.rows) {
+      try {
+        await client.query('BEGIN');
+        // Guard against a concurrent change: only zero it if it's still the
+        // exact balance we read (otherwise the member was active meanwhile).
+        const upd = await client.query(
+          'UPDATE members SET total_points = 0 WHERE member_id = $1 AND total_points = $2 RETURNING member_id',
+          [m.member_id, m.total_points]
+        );
+        if (upd.rowCount === 0) { await client.query('ROLLBACK'); continue; }
+        await client.query(
+          `INSERT INTO point_transactions (member_id, points_added, description, staff_id, served_member_name)
+           VALUES ($1, $2, 'System: 12-Month Expiry', NULL, $3)`,
+          [m.member_id, -m.total_points, m.full_name]
+        );
+        await client.query('COMMIT');
+        expiredCount++; pointsCleared += Number(m.total_points) || 0;
+        io.emit('pointsUpdated', { memberId: m.member_id, newTotal: 0 });
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error(`Point expiry failed for member ${m.member_id}:`, e.message);
+      }
+    }
+  } finally {
+    client.release();
+  }
+
+  if (expiredCount) {
+    console.log(`Point expiry: cleared ${pointsCleared} pts from ${expiredCount} inactive member(s).`);
+    await auditSystem('POINTS_EXPIRED', null, `${expiredCount} member(s), ${pointsCleared} pts cleared (12-month inactivity)`);
+    await notifyMasters(
+      `Point Expiry — 12-month inactivity\n\n` +
+      `Cleared ${pointsCleared.toLocaleString()} pts from ${expiredCount} inactive customer(s). ` +
+      `Liability written off your books.`
+    );
+  } else {
+    console.log('Point expiry: no inactive members to clear today.');
+  }
+  return { expiredCount, pointsCleared };
+}
+
+// Marketing save-the-sale list: points lapsing within EXPIRY_WARNING_DAYS.
+async function notifyExpiringSoon() {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  const soon = await pool.query(
+    `SELECT m.member_id, m.full_name, m.total_points, m.phone,
+            COALESCE(
+              (SELECT MAX(t.transaction_date) FROM point_transactions t WHERE t.member_id = m.member_id),
+              m.date_joined
+            ) AS last_activity
+       FROM members m
+      WHERE m.deleted_at IS NULL
+        AND COALESCE(m.is_frozen, false) = false
+        AND COALESCE(m.total_points, 0) > 0
+        AND COALESCE(
+              (SELECT MAX(t.transaction_date) FROM point_transactions t WHERE t.member_id = m.member_id),
+              m.date_joined
+            ) BETWEEN NOW() - ($1 || ' days')::interval
+                  AND NOW() - (($1 - $2) || ' days')::interval
+      ORDER BY last_activity ASC`,
+    [EXPIRY_DAYS, EXPIRY_WARNING_DAYS]
+  );
+  if (soon.rows.length === 0) return;
+
+  const dayMs = 24 * 60 * 60 * 1000;
+  const lines = soon.rows.map(r => {
+    const expiresOn = new Date(new Date(r.last_activity).getTime() + EXPIRY_DAYS * dayMs);
+    const daysLeft = Math.max(0, Math.ceil((expiresOn - Date.now()) / dayMs));
+    return `• ${r.full_name} — ${(Number(r.total_points) || 0).toLocaleString()} pts — ` +
+           `expires in ${daysLeft}d${r.phone ? ` — ${r.phone}` : ' — no contact on file'}`;
+  });
+  await notifyMasters(
+    `Points expiring within ${EXPIRY_WARNING_DAYS} days (${soon.rows.length}) — reach out to save the sale:\n\n` +
+    lines.join('\n')
+  );
+}
+
+// Scheduler: node-cron if present, else a minute-ticking setInterval fallback.
+async function runExpiryJob() {
+  try { await expireStalePoints(); await notifyExpiringSoon(); }
+  catch (e) { console.error('Expiry job error:', e.message); }
+}
+function nowInSG() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Singapore' }));
+}
+let lastExpiryRunDay = null;
+function startExpiryScheduler() {
+  if (cron) {
+    cron.schedule('0 2 * * *', runExpiryJob, { timezone: 'Asia/Singapore' });
+    console.log('Point-expiry cron scheduled for 02:00 Asia/Singapore.');
+  } else {
+    setInterval(() => {
+      const sg = nowInSG();
+      const day = sg.toISOString().slice(0, 10);
+      if (sg.getHours() === 2 && sg.getMinutes() === 0 && lastExpiryRunDay !== day) {
+        lastExpiryRunDay = day;
+        runExpiryJob();
+      }
+    }, 60 * 1000);
+    console.log('Point-expiry scheduler running via setInterval fallback (02:00 SGT).');
+  }
+}
+startExpiryScheduler();
+
 // ── Socket.IO authentication ──
 io.use(async (socket, next) => {
   try {
@@ -1215,9 +1500,101 @@ function requireMaster(req, res, next) {
   next();
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  Zod: request-body schemas + a tiny validation middleware
+// ════════════════════════════════════════════════════════════════════════
+// Define the shape ONCE; the middleware rejects bad payloads with a clean 400
+// and hands the route a parsed, normalised req.body — so routes stop repeating
+// manual `if (!x) ...` checks.
+function validateBody(schema) {
+  return (req, res, next) => {
+    const parsed = schema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      const msg = parsed.error.issues[0]?.message || 'Invalid request data.';
+      return res.status(400).json({ error: msg });
+    }
+    req.body = parsed.data; // normalised (trimmed, coerced, phone-cleaned)
+    next();
+  };
+}
+
+// Optional free-text that trims and turns '' into null.
+const optionalText = z.preprocess(
+  (v) => (v == null ? null : String(v).trim()),
+  z.string().nullable()
+).transform((v) => (v ? v : null));
+
+// Phone: reuses the SG/MY validator so error messages stay specific.
+// Accepts missing/empty (→ null) unless you make it required per-route.
+const phoneField = z.preprocess(
+  (v) => (v == null ? '' : String(v)),
+  z.string()
+).superRefine((val, ctx) => {
+  const r = validatePhoneNumber(val);
+  if (!r.ok) ctx.addIssue({ code: z.ZodIssueCode.custom, message: r.error });
+}).transform((val) => validatePhoneNumber(val).value);
+
+const newMemberSchema = z.object({
+  fullName: z.preprocess(v => (v == null ? '' : String(v).trim()),
+    z.string().min(1, 'Full name is required').max(100, 'Full name is too long.')),
+  carPlate: optionalText,
+  carModel: optionalText,
+  phone: phoneField,
+});
+
+const addCarSchema = z.object({
+  carPlate: optionalText,
+  carModel: optionalText,
+});
+
+const staffCreateSchema = z.object({
+  username: z.preprocess(v => (v == null ? '' : String(v).trim()),
+    z.string().min(1, 'Username is required.').max(50)),
+  password: z.string({ required_error: 'Password must be at least 10 characters.' })
+    .min(10, 'Password must be at least 10 characters.'),
+  role: z.enum(['Master', 'Admin', 'Technician'], { errorMap: () => ({ message: 'Invalid role.' }) }),
+  permissions: z.object({
+    can_add_member: z.boolean().optional(),
+    can_delete_member: z.boolean().optional(),
+    can_add_points: z.boolean().optional(),
+    can_deduct_points: z.boolean().optional(),
+  }).partial().optional().default({}),
+});
+
+const addPointsSchema = z.object({
+  memberId: z.coerce.number({ invalid_type_error: 'A member is required.' })
+    .int('A member is required.').positive('A member is required.'),
+  points: z.coerce.number({ invalid_type_error: 'Points must be a whole number.' })
+    .int('Points must be a whole number.'),
+  description: z.preprocess(v => (v == null ? '' : String(v).trim()),
+    z.string().max(200, 'Description is too long.')).optional().default(''),
+  carId: z.preprocess(
+    (v) => (v === '' || v == null ? undefined : v),
+    z.coerce.number().int().positive()
+  ).optional(),
+});
+
 // ── Health check ──
 app.get('/', (req, res) => {
   res.json({ status: 'Car Shop backend is running ✅' });
+});
+
+// ── Master: read the system audit trail (append-only; newest first) ──
+app.get('/api/audit-logs', requireMaster, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const result = await pool.query(
+      `SELECT id, staff_id, username, action_type, target_id, detail, ip, created_at
+         FROM system_audit_logs
+        ORDER BY created_at DESC
+        LIMIT $1`,
+      [limit]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('GET /api/audit-logs error:', err.message);
+    res.status(500).json({ error: 'Could not load audit logs.' });
+  }
 });
 
 // ── Change password ──
@@ -1363,11 +1740,8 @@ app.get('/api/staff', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/staff', requireAdmin, async (req, res) => {
-  const { username, password, role, permissions } = req.body;
-  if (!username || !username.trim()) return res.status(400).json({ error: 'Username is required.' });
-  if (!password || password.length < 10) return res.status(400).json({ error: 'Password must be at least 10 characters.' });
-  if (!VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role.' });
+app.post('/api/staff', requireAdmin, validateBody(staffCreateSchema), async (req, res) => {
+  const { username, password, role, permissions } = req.body; // validated + normalised
   // Only a Master may create Admin or Master accounts. Admins create Technicians.
   if (role !== 'Technician' && req.user.role !== 'Master') {
     return res.status(403).json({ error: 'Only a Master can create Admin or Master accounts.' });
@@ -1379,8 +1753,9 @@ app.post('/api/staff', requireAdmin, async (req, res) => {
       `INSERT INTO staff_users (username, password_hash, role, can_add_member, can_delete_member, can_add_points, can_deduct_points)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING id, username, role, can_add_member, can_delete_member, can_add_points, can_deduct_points, created_at`,
-      [username.trim(), hash, role, !!p.can_add_member, !!p.can_delete_member, !!p.can_add_points, !!p.can_deduct_points]
+      [username, hash, role, !!p.can_add_member, !!p.can_delete_member, !!p.can_add_points, !!p.can_deduct_points]
     );
+    await auditLog(req, 'CREATE_STAFF', result.rows[0].id, `created ${role} "${username}"`);
     res.json({ success: true, staff: result.rows[0] });
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'That username is already taken.' });
@@ -1426,6 +1801,7 @@ app.put('/api/staff/:id', requireAdmin, async (req, res) => {
       [id, role || null, !!p.can_add_member, !!p.can_delete_member, !!p.can_add_points, !!p.can_deduct_points]
     );
     // Changing permissions takes effect on their next request via getSessionUser.
+    await auditLog(req, 'UPDATE_STAFF', id, `role=${role || targetRole}, perms=${JSON.stringify(p)}`);
     res.json({ success: true });
   } catch (err) {
     console.error('PUT /api/staff error:', err.message);
@@ -1464,6 +1840,7 @@ app.post('/api/staff/:id/require-2fa', requireAdmin, requireManageTarget, async 
       [id, !!required]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
+    await auditLog(req, 'SET_STAFF_2FA', id, `require_2fa=${!!required} for "${req.targetStaff.username}"`);
     res.json({ success: true, required: !!required });
   } catch (err) {
     console.error('POST /api/staff require-2fa error:', err.message);
@@ -1483,6 +1860,7 @@ app.post('/api/staff/:id/unlink-telegram', requireAdmin, requireManageTarget, as
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
     await pool.query('DELETE FROM sessions WHERE staff_id = $1', [id]); // force re-login
+    await auditLog(req, 'UNLINK_STAFF_TELEGRAM', id, `unlinked Telegram for "${result.rows[0].username}"`);
     res.json({ success: true });
   } catch (err) {
     console.error('POST /api/staff unlink-telegram error:', err.message);
@@ -1500,6 +1878,7 @@ app.post('/api/staff/:id/reset-password', requireAdmin, requireManageTarget, asy
     const hash = await bcrypt.hash(newPassword, 12);
     await pool.query('UPDATE staff_users SET password_hash = $1 WHERE id = $2', [hash, id]);
     await pool.query('DELETE FROM sessions WHERE staff_id = $1', [id]); // force re-login
+    await auditLog(req, 'RESET_STAFF_PASSWORD', id, `reset password for "${req.targetStaff.username}"`);
     res.json({ success: true });
   } catch (err) {
     console.error('POST /api/staff reset-password error:', err.message);
@@ -1521,6 +1900,7 @@ app.delete('/api/staff/:id', requireAdmin, requireManageTarget, async (req, res)
       }
     }
     await pool.query('DELETE FROM staff_users WHERE id = $1', [id]);
+    await auditLog(req, 'DELETE_STAFF', id, `deleted ${req.targetStaff.role} "${req.targetStaff.username}"`);
     res.json({ success: true });
   } catch (err) {
     console.error('DELETE /api/staff error:', err.message);
@@ -1585,18 +1965,13 @@ function validatePhoneNumber(raw) {
   return { ok: true, value: cleaned }; // store the cleaned +code form so tel: links work
 }
 
-app.post('/api/new-member', requirePermission('can_add_member'), async (req, res) => {
+app.post('/api/new-member', requirePermission('can_add_member'), validateBody(newMemberSchema), async (req, res) => {
+  // Validated + normalised by Zod: fullName trimmed & non-empty, phone cleaned
+  // (or null). To require a phone, add `.min(1)` semantics in phoneField.
   const { fullName, carPlate, carModel, phone } = req.body;
-  if (!fullName || !fullName.trim()) {
-    return res.status(400).json({ error: 'Full name is required' });
-  }
-  const phoneCheck = validatePhoneNumber(phone);
-  if (!phoneCheck.ok) return res.status(400).json({ error: phoneCheck.error });
-  // To require a phone at registration, uncomment:
-  // if (!phoneCheck.value) return res.status(400).json({ error: 'A contact number is required.' });
   try {
     // Check for duplicate plate in cars table
-    const normalizedPlate = carPlate ? carPlate.trim().toUpperCase() : null;
+    const normalizedPlate = carPlate ? carPlate.toUpperCase() : null;
     if (normalizedPlate) {
       const existing = await pool.query(
         'SELECT cars.car_id, members.full_name FROM cars JOIN members ON cars.member_id = members.member_id WHERE UPPER(cars.car_plate) = $1',
@@ -1612,7 +1987,7 @@ app.post('/api/new-member', requirePermission('can_add_member'), async (req, res
     // Insert member
     const memberResult = await pool.query(
       'INSERT INTO members (full_name, total_points, date_joined, phone) VALUES ($1, 0, NOW(), $2) RETURNING *',
-      [fullName.trim(), phoneCheck.value]
+      [fullName, phone]
     );
     const newMember = memberResult.rows[0];
 
@@ -1629,6 +2004,7 @@ app.post('/api/new-member', requirePermission('can_add_member'), async (req, res
 
     const memberWithCars = { ...newMember, cars };
     io.emit('memberAdded', memberWithCars);
+    await auditLog(req, 'CREATE_MEMBER', newMember.member_id, `"${fullName}"${normalizedPlate ? ` · ${normalizedPlate}` : ''}`);
     res.json({ success: true, member: memberWithCars });
   } catch (err) {
     console.error('POST /api/new-member error:', err.message);
@@ -1637,12 +2013,12 @@ app.post('/api/new-member', requirePermission('can_add_member'), async (req, res
 });
 
 // ── Add a car to an existing member ──
-app.post('/api/add-car/:memberId', async (req, res) => {
+app.post('/api/add-car/:memberId', validateBody(addCarSchema), async (req, res) => {
   const { memberId } = req.params;
-  const { carPlate, carModel } = req.body;
+  const { carPlate, carModel } = req.body; // trimmed by Zod (or null)
 
   try {
-    const normalizedPlate = carPlate ? carPlate.trim().toUpperCase() : null;
+    const normalizedPlate = carPlate ? carPlate.toUpperCase() : null;
 
     // Check for duplicate plate
     if (normalizedPlate) {
@@ -1660,11 +2036,12 @@ app.post('/api/add-car/:memberId', async (req, res) => {
     const vehicleId = await findOrCreateVehicle(pool, normalizedPlate, carModel);
     const result = await pool.query(
       'INSERT INTO cars (member_id, car_plate, car_model, vehicle_id) VALUES ($1, $2, $3, $4) RETURNING *',
-      [memberId, normalizedPlate, carModel ? carModel.trim() : null, vehicleId]
+      [memberId, normalizedPlate, carModel || null, vehicleId]
     );
 
     const newCar = result.rows[0];
     io.emit('carAdded', { memberId: parseInt(memberId), car: newCar });
+    await auditLog(req, 'ADD_CAR', newCar.car_id, `${normalizedPlate || '(no plate)'} → member ${memberId}`);
     res.json({ success: true, car: newCar });
   } catch (err) {
     console.error('POST /api/add-car error:', err.message);
@@ -1688,6 +2065,7 @@ app.delete('/api/delete-car/:carId', async (req, res) => {
       return res.status(404).json({ error: 'Car not found' });
     }
     io.emit('carDeleted', { carId: parseInt(carId), memberId: result.rows[0].member_id });
+    await auditLog(req, 'DELETE_CAR', carId, `car removed from member ${result.rows[0].member_id}`);
     res.json({ success: true });
   } catch (err) {
     console.error('DELETE /api/delete-car error:', err.message);
@@ -2050,9 +2428,9 @@ const ROLE_POINT_LIMITS = {
   Master: Infinity,                  // Masters are never quarantined
 };
 
-app.post('/api/add-points', async (req, res) => {
-  const { memberId, points, description, carId } = req.body;
-  const numericPoints = parseInt(points, 10) || 0;
+app.post('/api/add-points', validateBody(addPointsSchema), async (req, res) => {
+  const { memberId, points, description, carId } = req.body; // validated by Zod
+  const numericPoints = points; // already an integer
 
   // 1) Authorization: add vs deduct permission based on the sign.
   const perm = numericPoints < 0 ? 'can_deduct_points' : 'can_add_points';
@@ -2060,9 +2438,23 @@ app.post('/api/add-points', async (req, res) => {
     return res.status(403).json({ error: `You do not have permission to ${numericPoints < 0 ? 'deduct' : 'add'} points.` });
   }
 
+  // ── Idempotency: ignore an accidental double-submit within the window ──
+  // The frontend sends a per-submission UUID in the Idempotency-Key header.
+  // If the same key lands twice inside IDEMPOTENCY_WINDOW_MS, we don't add the
+  // points again — we replay the first response.
+  const idemKey = req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || null;
+  if (idemKey) {
+    try {
+      const guard = await reserveIdempotencyKey(idemKey, req.user.id, 'add-points');
+      if (guard.replay) return res.status(guard.statusCode).json(guard.response);
+    } catch (e) {
+      console.error('Idempotency reserve failed (proceeding without it):', e.message);
+    }
+  }
+
   // car_id only applies to earning (a service done on a specific car).
   // For deductions (redemptions) it stays null.
-  const carIdToLog = numericPoints >= 0 && carId ? parseInt(carId, 10) : null;
+  const carIdToLog = numericPoints >= 0 && carId ? carId : null;
 
   // Does this addition cross the poster's role ceiling? (Masters: never.)
   const roleLimit = ROLE_POINT_LIMITS[req.user.role] ?? FRAUD_POINT_THRESHOLD;
@@ -2082,11 +2474,13 @@ app.post('/api/add-points', async (req, res) => {
     );
     if (memberQ.rows.length === 0) {
       await client.query('ROLLBACK');
+      if (idemKey) await releaseIdempotencyKey(idemKey);
       return res.status(404).json({ error: 'Member not found' });
     }
     const target = memberQ.rows[0];
     if (target.is_frozen) {
       await client.query('ROLLBACK');
+      if (idemKey) await releaseIdempotencyKey(idemKey);
       return res.status(422).json({
         error: 'This account is FROZEN. A Master must unfreeze it before any points can be added or redeemed.',
       });
@@ -2105,6 +2499,7 @@ app.post('/api/add-points', async (req, res) => {
     );
     if (result.rows.length === 0) {
       await client.query('ROLLBACK');
+      if (idemKey) await releaseIdempotencyKey(idemKey);
       const check = await pool.query('SELECT total_points FROM members WHERE member_id = $1', [memberId]);
       const current = Number(check.rows[0]?.total_points) || 0;
       return res.status(400).json({
@@ -2209,18 +2604,23 @@ app.post('/api/add-points', async (req, res) => {
       }).catch(e => console.error('Quarantine alert lookup failed:', e.message));
 
       console.warn(`QUARANTINE: tx #${tx.transaction_id} — ${numericPoints} pts by "${req.user.username}" (${req.user.role}) to member ${memberId}; ${quarantineReason}; member frozen.`);
-      return res.status(201).json({
+      const quarantinePayload = {
         success: true,
         newTotal,
         transactionId: tx.transaction_id,
         quarantined: true,
         warning: `Points recorded (transaction #${tx.transaction_id}), but a fraud tripwire fired (${quarantineReason}) — the customer's account is temporarily locked pending Master approval. Masters have been notified.`,
-      });
+      };
+      if (idemKey) await finalizeIdempotencyKey(idemKey, 201, quarantinePayload);
+      return res.status(201).json(quarantinePayload);
     }
 
-    res.status(200).json({ success: true, newTotal, transactionId: tx.transaction_id });
+    const okPayload = { success: true, newTotal, transactionId: tx.transaction_id };
+    if (idemKey) await finalizeIdempotencyKey(idemKey, 200, okPayload);
+    res.status(200).json(okPayload);
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
+    if (idemKey) await releaseIdempotencyKey(idemKey);
     console.error('POST /api/add-points error:', err.message);
     res.status(500).json({ error: 'Could not update points. Please try again.' });
   } finally {
@@ -2347,6 +2747,7 @@ app.delete('/api/delete-member/:id', requirePermission('can_delete_member'), asy
   try {
     await pool.query('UPDATE members SET deleted_at = NOW() WHERE member_id = $1', [memberId]);
     io.emit('memberDeleted', { memberId: parseInt(memberId) });
+    await auditLog(req, 'DELETE_MEMBER', memberId, 'moved to trash (soft delete)');
     res.json({ success: true });
   } catch (err) {
     console.error('DELETE /api/delete-member error:', err.message);
@@ -2393,6 +2794,7 @@ app.post('/api/restore-member/:id', requirePermission('can_delete_member'), asyn
     const cars = await pool.query('SELECT * FROM cars WHERE member_id = $1', [memberId]);
     const restored = { ...result.rows[0], cars: cars.rows };
     io.emit('memberAdded', restored); // reappears in everyone's list
+    await auditLog(req, 'RESTORE_MEMBER', memberId, `"${restored.full_name}" restored from trash`);
     res.json({ success: true, member: restored });
   } catch (err) {
     console.error('POST /api/restore-member error:', err.message);
@@ -2409,6 +2811,7 @@ app.delete('/api/purge-member/:id', requirePermission('can_delete_member'), asyn
     await pool.query('UPDATE point_transactions SET member_id = NULL, car_id = NULL WHERE member_id = $1', [memberId]);
     await pool.query('DELETE FROM cars WHERE member_id = $1', [memberId]);
     await pool.query('DELETE FROM members WHERE member_id = $1 AND deleted_at IS NOT NULL', [memberId]);
+    await auditLog(req, 'PURGE_MEMBER', memberId, 'permanently deleted from trash');
     res.json({ success: true });
   } catch (err) {
     console.error('DELETE /api/purge-member error:', err.message);

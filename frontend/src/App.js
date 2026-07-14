@@ -2,6 +2,15 @@ import React, { useEffect, useState, useCallback } from 'react';
 import io from 'socket.io-client';
 
 const API_BASE = 'https://car-shop-system.onrender.com';
+
+// Stable idempotency keys per member, so a submit that's retried after a
+// network drop reuses the SAME key and the server ignores the duplicate.
+// Cleared only after a confirmed success (see handleUpdatePoints).
+const pendingIdemKeys = new Map();
+const newIdemKey = () =>
+  (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 // Socket connects only after login, sending the session token in the
 // handshake so the server can authenticate it. autoConnect:false prevents
 // an unauthenticated connection attempt on page load.
@@ -82,11 +91,12 @@ let _onUnauthorized = () => {};
 
 const apiFetch = (path, opts = {}) =>
   fetch(`${API_BASE}${path}`, {
+    ...opts,
     headers: {
       'Content-Type': 'application/json',
       'x-admin-token': localStorage.getItem('carshop_token') || '',
+      ...(opts.headers || {}), // allow per-call headers (e.g. Idempotency-Key)
     },
-    ...opts,
   }).then(async (res) => {
     if (res.status === 401) {
       localStorage.removeItem('carshop_token');
@@ -1833,15 +1843,24 @@ export default function App() {
       }
     }
     const description = (descriptions[id] || '').trim() || 'Manual Adjustment';
+    // Reuse an existing key if a prior attempt for this member is still pending
+    // (i.e. the last submit errored) so a retry dedupes instead of double-adding.
+    let idemKey = pendingIdemKeys.get(id);
+    if (!idemKey) { idemKey = newIdemKey(); pendingIdemKeys.set(id, idemKey); }
     try {
       const data = await apiFetch('/api/add-points', {
         method: 'POST',
+        headers: { 'Idempotency-Key': idemKey },
         body: JSON.stringify({ memberId: id, points: pts, description, carId }),
       });
+      pendingIdemKeys.delete(id); // confirmed outcome — next submit gets a fresh key
       if (data && data.quarantined) {
         // Points recorded, but the account was quarantined pending Master review.
         toast(data.warning || 'Points recorded — account locked pending Master approval.', 'warn');
         setMembers(prev => prev.map(m => m.member_id == id ? { ...m, is_frozen: true } : m));
+      } else if (data && data.duplicate) {
+        // A duplicate submit landed inside the window — first one already counted.
+        toast('Already submitted — ignored the duplicate.', 'warn');
       } else {
         toast(`${pts >= 0 ? '+' : ''}${pts} pts · ${description}`);
       }
