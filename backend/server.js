@@ -843,6 +843,33 @@ async function handleTrashBinCommand(chatId) {
   await sendTelegram(chatId, `🗑️ Accounts pending permanent deletion:\n${lines.join('\n')}`);
 }
 
+// /review — all of today's transactions (SG time) for the Master to eyeball.
+// LEFT JOINs staff + members so it still reads well after purges. Master only.
+async function handleReviewCommand(chatId) {
+  const r = await pool.query(
+    `SELECT t.transaction_id, t.transaction_date, t.points_added, t.description,
+            COALESCE(m.full_name, t.served_member_name, '—') AS customer_name,
+            u.username AS staff_name
+       FROM point_transactions t
+       LEFT JOIN members m ON m.member_id = t.member_id
+       LEFT JOIN staff_users u ON u.id = t.staff_id
+      WHERE (t.transaction_date AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Singapore')::date
+            = (NOW() AT TIME ZONE 'Asia/Singapore')::date
+      ORDER BY t.transaction_date ASC`
+  );
+  if (r.rows.length === 0) {
+    await sendTelegram(chatId, 'No transactions to review today.');
+    return;
+  }
+  const lines = r.rows.map(t => {
+    const time = new Date(t.transaction_date).toLocaleTimeString('en-SG', { hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Singapore' });
+    const sign = t.points_added >= 0 ? '+' : '';
+    const staff = t.staff_name || 'system';
+    return `${time} · #${t.transaction_id} · ${sign}${t.points_added} pts · ${t.customer_name} · by ${staff} · ${t.description || 'Service'}`;
+  });
+  await sendTelegram(chatId, `📋 Today's Transactions (${r.rows.length}):\n\n${lines.join('\n')}`);
+}
+
 // Route a message from a verified staff member, gated by their exact role.
 async function handleStaffMessage(chatId, staff, text) {
   const parts = text.trim().split(/\s+/);
@@ -983,6 +1010,14 @@ async function handleStaffMessage(chatId, staff, text) {
       await handleVoidedCommand(chatId);
       return;
 
+    case '/review':
+      if (!isMaster) {
+        await sendTelegram(chatId, 'Only the Master can use /review.');
+        return;
+      }
+      await handleReviewCommand(chatId);
+      return;
+
     case '/trash_bin':
       if (!isMaster) {
         await sendTelegram(chatId, 'Only the Master can use /trash_bin.');
@@ -1013,6 +1048,7 @@ async function handleStaffMessage(chatId, staff, text) {
         lines.push('/staff — all staff + 2FA status');
         lines.push('/audit <username> — last 10 point actions by a staff member');
         lines.push('/voided — void/reject/reverse entries (last 48h)');
+        lines.push('/review — all of today\'s transactions');
         lines.push('/trash_bin — members pending permanent deletion');
         lines.push('/backup — row-count health check');
         lines.push('/toggle_reports — enable/disable Admin EOD reports');
@@ -2592,6 +2628,92 @@ app.post('/api/transactions/:txId/reject', requireMaster, async (req, res) => {
   const result = await reviewQuarantinedTransaction(req.params.txId, 'reject', req.user);
   if (!result.ok) return res.status(result.error.includes('No pending') ? 404 : 500).json({ error: result.error });
   res.json({ success: true, newTotal: result.newTotal, unfrozen: result.unfrozen, disabledStaff: result.disabledStaff });
+});
+
+// ── Void a transaction (Master only): post an exact reversing ledger entry ──
+// Unlike editing, a void never mutates the original row — it appends an inverse
+// transaction ("VOID of Tx #<id>") so the audit trail stays intact. Everything
+// runs in one DB transaction; the original row is locked FOR UPDATE so two
+// concurrent voids can't both slip past the double-void check.
+app.post('/api/transactions/:id/void', requireMaster, async (req, res) => {
+  const { id } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 3) Fetch the original (row-locked to serialise concurrent voids).
+    const origQ = await client.query(
+      'SELECT * FROM point_transactions WHERE transaction_id = $1 FOR UPDATE',
+      [id]
+    );
+    if (origQ.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Transaction not found.' });
+    }
+    const orig = origQ.rows[0];
+    const voidDesc = `VOID of Tx #${id}`;
+
+    // 4) Double-void protection — has a reversal for this id already been posted?
+    const dup = await client.query(
+      'SELECT 1 FROM point_transactions WHERE description = $1 LIMIT 1',
+      [voidDesc]
+    );
+    if (dup.rows.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `Transaction #${id} has already been voided.` });
+    }
+
+    // A reversal only makes sense against a live member balance.
+    if (orig.member_id == null) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This transaction is not linked to a member and cannot be voided.' });
+    }
+
+    const reverse = -Number(orig.points_added); // exact inverse
+
+    // 5) Reverse the math; the WHERE clause keeps the balance from going below 0.
+    const upd = await client.query(
+      `UPDATE members
+          SET total_points = COALESCE(total_points, 0) + $1
+        WHERE member_id = $2
+          AND COALESCE(total_points, 0) + $1 >= 0
+        RETURNING total_points`,
+      [reverse, orig.member_id]
+    );
+    if (upd.rows.length === 0) {
+      await client.query('ROLLBACK');
+      const cur = await pool.query('SELECT total_points FROM members WHERE member_id = $1', [orig.member_id]);
+      const bal = Number(cur.rows[0]?.total_points) || 0;
+      return res.status(400).json({
+        error: `Voiding this transaction would drop the balance below zero (current ${bal} pts, reversal ${reverse} pts). The customer has likely already redeemed these points.`,
+      });
+    }
+    const newTotal = upd.rows[0].total_points;
+
+    // 6) Ledger entry: exact inverse, same member/car/vehicle, current Master as staff.
+    const txResult = await client.query(
+      `INSERT INTO point_transactions
+         (member_id, points_added, description, staff_id, car_id, vehicle_id, served_member_name)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING transaction_id, points_added, description, transaction_date, staff_id, car_id`,
+      [orig.member_id, reverse, voidDesc, req.user.id, orig.car_id, orig.vehicle_id, orig.served_member_name]
+    );
+    const tx = txResult.rows[0];
+
+    // 7) Commit, then real-time emits.
+    await client.query('COMMIT');
+    io.emit('pointsUpdated', { memberId: orig.member_id, newTotal });
+    io.emit('transactionAdded', { memberId: orig.member_id, transaction: tx });
+
+    await auditLog(req, 'VOID_TRANSACTION', id, `reversed ${orig.points_added} pts (tx #${id}) → void tx #${tx.transaction_id}`);
+    res.json({ success: true, newTotal, voidTransactionId: tx.transaction_id, reversed: reverse });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('POST /api/transactions/:id/void error:', err.message);
+    res.status(500).json({ error: 'Could not void the transaction. Please try again.' });
+  } finally {
+    client.release();
+  }
 });
 
 // ── Fraud interceptor: per-role single-transaction point ceilings ──
