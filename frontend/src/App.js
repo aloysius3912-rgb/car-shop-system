@@ -704,10 +704,11 @@ function CarsPanel({ member, theme, onCarAdded, onCarDeleted }) {
 // ── History drawer ──
 const EDIT_WINDOW_MINUTES = 60;
 
-function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit, onEdited }) {
+function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit, isMaster, onEdited }) {
   const [editingId, setEditingId] = useState(null);
   const [editValue, setEditValue] = useState('');
   const [saving, setSaving] = useState(false);
+  const [voidingId, setVoidingId] = useState(null);
   const [trailOpenId, setTrailOpenId] = useState(null); // which tx's edit trail is expanded
 
   if (!isOpen) return null;
@@ -737,6 +738,36 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit
     }
   };
 
+  // Master-only: post a reversing "VOID of Tx #<id>" entry. The original row is
+  // never mutated, so the ledger stays intact; the server handles the balance math.
+  const voidTx = async (tx) => {
+    const sign = tx.points_added >= 0 ? '+' : '';
+    if (!window.confirm(
+      `Void transaction #${tx.transaction_id}?\n\n` +
+      `"${tx.description || 'No description'}"  (${sign}${tx.points_added} pts)\n\n` +
+      `This posts a reversing entry that undoes these points. It stays in the ledger and can't be undone.`
+    )) return;
+    setVoidingId(tx.transaction_id);
+    try {
+      await apiFetch(`/api/transactions/${tx.transaction_id}/void`, { method: 'POST' });
+      toast(`Transaction #${tx.transaction_id} voided — ${tx.points_added >= 0 ? '−' : '+'}${Math.abs(tx.points_added).toLocaleString()} pts reversed.`);
+      onEdited && onEdited(memberId);
+    } catch (err) {
+      toast(`Void failed: ${err.message}`, 'error');
+    } finally {
+      setVoidingId(null);
+    }
+  };
+
+  // Which originals already have a VOID reversal in this list (so we show a tag
+  // instead of a button and never trip the server's double-void guard).
+  const voidedOriginalIds = new Set(
+    transactions
+      .map(t => (t.description || '').match(/^VOID of Tx #(\d+)$/))
+      .filter(Boolean)
+      .map(m => parseInt(m[1], 10))
+  );
+
   return (
     <div style={{ width: '100%', marginTop: 14, paddingTop: 14, borderTop: `1px solid ${theme.border}`, animation: 'fadeIn 0.2s ease both' }}>
       <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 2, marginBottom: 10, textTransform: 'uppercase' }}>Transaction History</div>
@@ -751,6 +782,10 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit
             const ageMinutes = (Date.now() - new Date(tx.transaction_date).getTime()) / 60000;
             const editable = canEdit && !tx.quarantine_status && ageMinutes <= EDIT_WINDOW_MINUTES;
             const isEditing = editingId === tx.transaction_id;
+            const isVoidEntry = /^VOID of Tx #\d+$/.test(tx.description || '');
+            const alreadyVoided = voidedOriginalIds.has(tx.transaction_id);
+            const voidable = isMaster && !isVoidEntry && !alreadyVoided
+              && tx.quarantine_status !== 'pending' && tx.quarantine_status !== 'rejected';
             const edits = Array.isArray(tx.edits) ? tx.edits : [];
             const trailOpen = trailOpenId === tx.transaction_id;
             return (
@@ -806,6 +841,14 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit
                         <button onClick={() => startEdit(tx)} title={`Fix a typo within ${EDIT_WINDOW_MINUTES} minutes of posting`} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textDim, borderRadius: 6, padding: '3px 9px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>
                           Edit
                         </button>
+                      )}
+                      {voidable && (
+                        <button onClick={() => voidTx(tx)} disabled={voidingId === tx.transaction_id} title="Reverse this transaction (posts a VOID entry, Master only)" style={{ background: 'none', border: '1px solid #ef444455', color: '#ef4444', borderRadius: 6, padding: '3px 9px', cursor: voidingId === tx.transaction_id ? 'default' : 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace", opacity: voidingId === tx.transaction_id ? 0.6 : 1 }}>
+                          {voidingId === tx.transaction_id ? '…' : 'Void'}
+                        </button>
+                      )}
+                      {isMaster && alreadyVoided && !isVoidEntry && (
+                        <span title="A reversal has been posted for this transaction" style={{ color: theme.textFaint, fontSize: 10, fontWeight: 700, letterSpacing: 1, border: `1px solid ${theme.border}`, borderRadius: 5, padding: '2px 7px' }}>VOIDED</span>
                       )}
                     </>
                   )}
@@ -2216,6 +2259,7 @@ export default function App() {
                     loading={!!historyLoading[member.member_id]}
                     theme={theme}
                     canEdit={can('can_add_points') || can('can_deduct_points')}
+                    isMaster={isMaster}
                     onEdited={refreshHistory}
                   />
                 </div>
