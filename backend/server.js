@@ -240,6 +240,49 @@ async function ensureOpsTables() {
 }
 ensureOpsTables().catch(err => console.error('Ops tables setup failed:', err.message));
 
+// ── Guarantee a member can't hold the same plate twice ──
+// The app-level "is this plate taken?" check is check-then-insert, so two
+// near-simultaneous adds (double-tap / "Add anyway" fired twice / network
+// retry) can both pass it and both insert. A partial unique index makes the DB
+// itself reject the second write. First we collapse any duplicates that already
+// slipped in, repointing their transactions to the surviving row so no service
+// history is lost, then we create the index.
+async function ensureCarUniqueness() {
+  // 1a) Move transactions off soon-to-be-removed duplicate rows onto the keeper.
+  await pool.query(`
+    WITH ranked AS (
+      SELECT car_id,
+             MIN(car_id) OVER (PARTITION BY member_id, UPPER(car_plate)) AS keep_id
+        FROM cars
+       WHERE car_plate IS NOT NULL
+    )
+    UPDATE point_transactions t
+       SET car_id = r.keep_id
+      FROM ranked r
+     WHERE t.car_id = r.car_id AND r.car_id <> r.keep_id
+  `);
+  // 1b) Delete the duplicate rows, keeping the oldest (lowest car_id) per group.
+  const del = await pool.query(`
+    DELETE FROM cars c
+     USING (
+       SELECT car_id,
+              MIN(car_id) OVER (PARTITION BY member_id, UPPER(car_plate)) AS keep_id
+         FROM cars
+        WHERE car_plate IS NOT NULL
+     ) d
+     WHERE c.car_id = d.car_id AND d.car_id <> d.keep_id
+  `);
+  if (del.rowCount) console.log(`Car de-dupe: removed ${del.rowCount} duplicate car row(s).`);
+  // 2) Enforce one plate per member (case-insensitive) from here on.
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS cars_member_plate_uniq
+      ON cars (member_id, UPPER(car_plate))
+      WHERE car_plate IS NOT NULL
+  `);
+  console.log('Car uniqueness index ready (one plate per member).');
+}
+ensureCarUniqueness().catch(err => console.error('Car uniqueness setup failed:', err.message));
+
 // Find the physical vehicle for a plate, creating it if this plate is new.
 // `db` can be the pool or a transaction client.
 async function findOrCreateVehicle(db, plate, model) {
@@ -2220,6 +2263,9 @@ app.post('/api/new-member', requirePermission('can_add_member'), validateBody(ne
     await auditLog(req, 'CREATE_MEMBER', newMember.member_id, `"${fullName}"${normalizedPlate ? ` · ${normalizedPlate}` : ''}`);
     res.json({ success: true, member: memberWithCars });
   } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'That car plate is already registered. Please check and try again.' });
+    }
     console.error('POST /api/new-member error:', err.message);
     res.status(500).json({ error: err.message });
   }
@@ -2229,19 +2275,23 @@ app.post('/api/new-member', requirePermission('can_add_member'), validateBody(ne
 app.post('/api/add-car/:memberId', validateBody(addCarSchema), async (req, res) => {
   const { memberId } = req.params;
   const { carPlate, carModel } = req.body; // trimmed by Zod (or null)
+  const normalizedPlate = carPlate ? carPlate.toUpperCase() : null;
 
   try {
-    const normalizedPlate = carPlate ? carPlate.toUpperCase() : null;
-
-    // Check for duplicate plate
+    // Check for duplicate plate (distinguish "already on THIS member" from
+    // "owned by someone else" for a clearer message).
     if (normalizedPlate) {
       const existing = await pool.query(
-        'SELECT cars.car_id, members.full_name FROM cars JOIN members ON cars.member_id = members.member_id WHERE UPPER(cars.car_plate) = $1',
+        'SELECT c.car_id, c.member_id, m.full_name FROM cars c JOIN members m ON c.member_id = m.member_id WHERE UPPER(c.car_plate) = $1',
         [normalizedPlate]
       );
       if (existing.rows.length > 0) {
+        const row = existing.rows[0];
+        const sameMember = String(row.member_id) === String(memberId);
         return res.status(409).json({
-          error: `Plate ${normalizedPlate} is already registered to ${existing.rows[0].full_name}`,
+          error: sameMember
+            ? `${normalizedPlate} is already on this customer's account.`
+            : `Plate ${normalizedPlate} is already registered to ${row.full_name}.`,
         });
       }
     }
@@ -2257,6 +2307,10 @@ app.post('/api/add-car/:memberId', validateBody(addCarSchema), async (req, res) 
     await auditLog(req, 'ADD_CAR', newCar.car_id, `${normalizedPlate || '(no plate)'} → member ${memberId}`);
     res.json({ success: true, car: newCar });
   } catch (err) {
+    // 23505 = the unique index caught a duplicate that raced past the check above.
+    if (err.code === '23505') {
+      return res.status(409).json({ error: `${normalizedPlate || 'That car'} is already on this customer's account.` });
+    }
     console.error('POST /api/add-car error:', err.message);
     res.status(500).json({ error: err.message });
   }

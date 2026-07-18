@@ -563,7 +563,9 @@ function CarsPanel({ member, theme, onCarAdded, onCarDeleted }) {
   const [returningInfo, setReturningInfo] = useState(null); // returning-vehicle confirm gate
 
   const doAddCar = async () => {
+    if (adding) return; // guard against a double-click on "Add anyway"
     setAdding(true);
+    setReturningInfo(null); // close the confirm immediately so it can't re-fire
     try {
       const data = await apiFetch(`/api/add-car/${member.member_id}`, {
         method: 'POST',
@@ -584,6 +586,11 @@ function CarsPanel({ member, theme, onCarAdded, onCarDeleted }) {
     e.preventDefault();
     if (!newPlate.trim() && !newModel.trim()) { toast('Enter a plate or model', 'warn'); return; }
     const plate = newPlate.trim().toUpperCase();
+    // Instant guard: this member already has this plate — no round-trip needed.
+    if (plate && (member.cars || []).some(c => (c.car_plate || '').toUpperCase() === plate)) {
+      toast(`${plate} is already on this customer's account.`, 'warn');
+      return;
+    }
     if (plate.length >= 3) {
       setAdding(true);
       const pre = await apiFetch(`/api/plate-precheck/${encodeURIComponent(plate)}`).catch(() => null);
