@@ -181,6 +181,23 @@ async function ensureVehicleModel() {
       FROM members m
      WHERE t.member_id = m.member_id AND t.served_member_name IS NULL;
   `);
+  // Snapshot the serviced car's plate/model onto each transaction so the history
+  // keeps its detail even after the car is removed (car_id gets nulled on delete,
+  // but the transaction should still show what the points were for). Backfill
+  // from the live car if it still exists, else from the durable vehicle record.
+  await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS served_car_plate VARCHAR(30);`);
+  await pool.query(`ALTER TABLE point_transactions ADD COLUMN IF NOT EXISTS served_car_model VARCHAR(100);`);
+  await pool.query(`
+    UPDATE point_transactions t
+       SET served_car_plate = COALESCE(c.car_plate, v.plate),
+           served_car_model = COALESCE(c.car_model, v.car_model)
+      FROM point_transactions base
+      LEFT JOIN cars c     ON c.car_id = base.car_id
+      LEFT JOIN vehicles v ON v.vehicle_id = base.vehicle_id
+     WHERE base.transaction_id = t.transaction_id
+       AND t.served_car_plate IS NULL
+       AND COALESCE(c.car_plate, v.plate) IS NOT NULL;
+  `);
   console.log('Vehicle model ready.');
 }
 ensureVehicleModel().catch(err => console.error('Vehicle model setup failed:', err.message));
@@ -2747,10 +2764,10 @@ app.post('/api/transactions/:id/void', requireMaster, async (req, res) => {
     // 6) Ledger entry: exact inverse, same member/car/vehicle, current Master as staff.
     const txResult = await client.query(
       `INSERT INTO point_transactions
-         (member_id, points_added, description, staff_id, car_id, vehicle_id, served_member_name)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+         (member_id, points_added, description, staff_id, car_id, vehicle_id, served_member_name, served_car_plate, served_car_model)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING transaction_id, points_added, description, transaction_date, staff_id, car_id`,
-      [orig.member_id, reverse, voidDesc, req.user.id, orig.car_id, orig.vehicle_id, orig.served_member_name]
+      [orig.member_id, reverse, voidDesc, req.user.id, orig.car_id, orig.vehicle_id, orig.served_member_name, orig.served_car_plate, orig.served_car_model]
     );
     const tx = txResult.rows[0];
 
@@ -2861,19 +2878,22 @@ app.post('/api/add-points', validateBody(addPointsSchema), async (req, res) => {
     }
 
     // Resolve the physical vehicle (durable history spine) and snapshot the
-    // owner's name so the record stays meaningful even after a member purge.
-    let vehicleIdToLog = null;
+    // owner's name + the serviced car's plate/model so the record stays fully
+    // meaningful even after the car is removed or the member is purged.
+    let vehicleIdToLog = null, servedPlate = null, servedModel = null;
     if (carIdToLog) {
-      const vq = await client.query('SELECT vehicle_id FROM cars WHERE car_id = $1', [carIdToLog]);
+      const vq = await client.query('SELECT vehicle_id, car_plate, car_model FROM cars WHERE car_id = $1', [carIdToLog]);
       vehicleIdToLog = vq.rows[0]?.vehicle_id || null;
+      servedPlate = vq.rows[0]?.car_plate || null;
+      servedModel = vq.rows[0]?.car_model || null;
     }
 
     // Logging: the history record, returning the generated transaction_id.
     const txResult = await client.query(
-      `INSERT INTO point_transactions (member_id, points_added, description, staff_id, car_id, vehicle_id, served_member_name)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO point_transactions (member_id, points_added, description, staff_id, car_id, vehicle_id, served_member_name, served_car_plate, served_car_model)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING transaction_id, points_added, description, transaction_date, staff_id, car_id`,
-      [memberId, numericPoints, description, req.user.id, carIdToLog, vehicleIdToLog, target.full_name]
+      [memberId, numericPoints, description, req.user.id, carIdToLog, vehicleIdToLog, target.full_name, servedPlate, servedModel]
     );
     const tx = txResult.rows[0];
 
@@ -2989,7 +3009,8 @@ app.get('/api/transactions/:memberId', async (req, res) => {
       `SELECT t.transaction_id, t.points_added, t.description, t.transaction_date,
               t.quarantine_status, t.original_points, t.edited_at,
               u.username AS staff_name,
-              c.car_plate, c.car_model,
+              COALESCE(t.served_car_plate, c.car_plate, v.plate) AS car_plate,
+              COALESCE(t.served_car_model, c.car_model, v.car_model) AS car_model,
               COALESCE((
                 SELECT json_agg(json_build_object(
                          'old', el.old_points,
@@ -3004,6 +3025,7 @@ app.get('/api/transactions/:memberId', async (req, res) => {
          FROM point_transactions t
          LEFT JOIN staff_users u ON u.id = t.staff_id
          LEFT JOIN cars c ON c.car_id = t.car_id
+         LEFT JOIN vehicles v ON v.vehicle_id = t.vehicle_id
         WHERE t.member_id = $1
         ORDER BY t.transaction_date DESC LIMIT 50`,
       [memberId]
