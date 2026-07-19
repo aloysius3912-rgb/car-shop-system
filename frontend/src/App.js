@@ -897,6 +897,79 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
   const [challengeToken, setChallengeToken] = useState(null);
   const [pin, setPin] = useState('');
   const [verifying, setVerifying] = useState(false);
+  // Forgot-password flow: 'request' (enter username) → 'reset' (PIN + new password)
+  const [forgotMode, setForgotMode] = useState(null);
+  const [resetToken, setResetToken] = useState(null);
+  const [resetPin, setResetPin] = useState('');
+  const [newPw, setNewPw] = useState('');
+  const [newPw2, setNewPw2] = useState('');
+  const [notice, setNotice] = useState('');
+
+  const startForgot = () => {
+    setForgotMode('request'); setResetToken(null); setResetPin('');
+    setNewPw(''); setNewPw2(''); setError(''); setNotice('');
+  };
+  const exitForgot = () => {
+    setForgotMode(null); setResetToken(null); setResetPin('');
+    setNewPw(''); setNewPw2(''); setError(''); setNotice('');
+  };
+
+  const requestReset = async (e) => {
+    e.preventDefault();
+    if (!username.trim()) { setError('Enter your username first.'); return; }
+    setError(''); setLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/forgot-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: username.trim() }),
+      });
+      const data = await res.json();
+      if (res.ok && data.challengeToken) {
+        setResetToken(data.challengeToken);
+        setForgotMode('reset');
+        setNotice('');
+      } else if (res.ok) {
+        // Generic answer (account unknown or no Telegram linked) — stay here.
+        setNotice(data.message || 'If that account has Telegram linked, a PIN has been sent.');
+      } else {
+        setError(data.error || 'Could not start the reset.');
+      }
+    } catch {
+      setError('Could not reach server. Try again in a moment.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const submitReset = async (e) => {
+    e.preventDefault();
+    if (resetPin.length !== 4) { setError('Enter the 4-digit PIN from Telegram.'); return; }
+    if (newPw.length < 10) { setError('New password must be at least 10 characters.'); return; }
+    if (newPw !== newPw2) { setError('Passwords do not match.'); return; }
+    setError(''); setVerifying(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/forgot-password/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ challengeToken: resetToken, pin: resetPin, newPassword: newPw }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        exitForgot();
+        setPassword('');
+        setNotice('Password changed — log in with your new password.');
+      } else {
+        setError(data.error || 'Could not reset the password.');
+        setResetPin('');
+        if (data.restart) { setForgotMode('request'); setResetToken(null); }
+      }
+    } catch {
+      setError('Could not reach server. Try again in a moment.');
+    } finally {
+      setVerifying(false);
+    }
+  };
 
   const finishLogin = (data) => {
     localStorage.setItem('carshop_token', data.token);
@@ -971,6 +1044,87 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
     setError('');
   };
 
+  // ── Forgot password: step 1 (request PIN) ──
+  if (forgotMode === 'request') {
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'JetBrains Mono', monospace", background: theme.bg, padding: 20, transition: 'background 0.2s ease' }}>
+        <style>{`
+          @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@600;700;800&display=swap');
+          @keyframes spin { to { transform: rotate(360deg); } }
+        `}</style>
+        <div style={{ position: 'fixed', top: 20, right: 20 }}>
+          <ThemeToggle theme={theme} themeName={themeName} onToggle={onToggleTheme} />
+        </div>
+        <form onSubmit={requestReset} style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '40px 36px', maxWidth: 360, width: '100%', textAlign: 'center' }}>
+          <div style={{ fontSize: 11, letterSpacing: 4, color: theme.accent, marginBottom: 6, textTransform: 'uppercase' }}>Password Reset</div>
+          <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 24, color: theme.text, fontWeight: 800, marginBottom: 10, letterSpacing: -0.5 }}>
+            Forgot Password
+          </h1>
+          <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.5, marginBottom: 20 }}>
+            Enter your username. If your account has Telegram 2FA linked, a 4-digit PIN will be sent there to verify it's you.
+          </p>
+          <input type="text" placeholder="Username" value={username} onChange={e => setUsername(e.target.value)} autoFocus autoCapitalize="none"
+            style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 16, marginBottom: 14 })} />
+          {notice && <div style={{ color: theme.accent, fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>{notice}</div>}
+          {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
+          <button type="submit" disabled={loading} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: loading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
+            {loading && <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />}
+            {loading ? 'Sending…' : 'Send Reset PIN'}
+          </button>
+          <p style={{ color: theme.textFaint, fontSize: 11, lineHeight: 1.5, marginBottom: 12 }}>
+            No Telegram linked? Ask a Master to reset your password from the Staff panel.
+          </p>
+          <button type="button" onClick={exitForgot} style={{ background: 'none', border: 'none', color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, cursor: 'pointer', letterSpacing: 1 }}>
+            ← Back to login
+          </button>
+        </form>
+      </div>
+    );
+  }
+
+  // ── Forgot password: step 2 (PIN + new password) ──
+  if (forgotMode === 'reset') {
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'JetBrains Mono', monospace", background: theme.bg, padding: 20, transition: 'background 0.2s ease' }}>
+        <style>{`
+          @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@600;700;800&display=swap');
+          @keyframes spin { to { transform: rotate(360deg); } }
+        `}</style>
+        <div style={{ position: 'fixed', top: 20, right: 20 }}>
+          <ThemeToggle theme={theme} themeName={themeName} onToggle={onToggleTheme} />
+        </div>
+        <form onSubmit={submitReset} style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '40px 36px', maxWidth: 360, width: '100%', textAlign: 'center' }}>
+          <div style={{ fontSize: 11, letterSpacing: 4, color: theme.accent, marginBottom: 6, textTransform: 'uppercase' }}>Password Reset</div>
+          <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 24, color: theme.text, fontWeight: 800, marginBottom: 10, letterSpacing: -0.5 }}>
+            Verify &amp; Set New Password
+          </h1>
+          <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.5, marginBottom: 20 }}>
+            A 4-digit PIN was sent to your Telegram. Enter it with your new password (min 10 characters).
+          </p>
+          <input
+            type="text" inputMode="numeric" autoComplete="one-time-code" pattern="\d*" maxLength={4}
+            placeholder="0000" value={resetPin}
+            onChange={e => setResetPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+            autoFocus disabled={verifying}
+            style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 22, letterSpacing: 12, marginBottom: 10, display: 'block', fontWeight: 700, padding: '11px 0 11px 12px' })}
+          />
+          <input type="password" placeholder="New password (min 10 chars)" value={newPw} onChange={e => setNewPw(e.target.value)}
+            style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 15, marginBottom: 10 })} />
+          <input type="password" placeholder="Repeat new password" value={newPw2} onChange={e => setNewPw2(e.target.value)}
+            style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 15, marginBottom: 14 })} />
+          {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
+          <button type="submit" disabled={verifying} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: verifying ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
+            {verifying && <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />}
+            {verifying ? 'Changing…' : 'Change Password'}
+          </button>
+          <button type="button" onClick={exitForgot} style={{ background: 'none', border: 'none', color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, cursor: 'pointer', letterSpacing: 1 }}>
+            ← Back to login
+          </button>
+        </form>
+      </div>
+    );
+  }
+
   // ── PIN step ──
   if (challengeToken) {
     return (
@@ -1038,10 +1192,14 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
           style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 16, marginBottom: 10 })} />
         <input type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)}
           style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 16, marginBottom: 14 })} />
+        {notice && <div style={{ color: theme.accent, fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>{notice}</div>}
         {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
-        <button type="submit" disabled={loading} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: loading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+        <button type="submit" disabled={loading} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: loading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
           {loading && <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />}
           {loading ? 'Checking…' : 'Login'}
+        </button>
+        <button type="button" onClick={startForgot} style={{ background: 'none', border: 'none', color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, cursor: 'pointer', letterSpacing: 1 }}>
+          Forgot password?
         </button>
       </form>
     </div>
