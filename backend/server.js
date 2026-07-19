@@ -2352,24 +2352,54 @@ app.delete('/api/staff/:id', requireAdmin, requireManageTarget, async (req, res)
 });
 
 // ── Fetch ALL members with their cars ──
+// ── Members list: paginated + server-side search ──
+// Loading every member (and every car in the DB) into one response stops
+// scaling past a few hundred customers. The list is now paged: ?page=1&limit=25
+// &search=q — search matches name, plate, or model. Cars are fetched only for
+// the members on the current page.
 app.get('/api/members', async (req, res) => {
   try {
-    const membersResult = await pool.query('SELECT * FROM members WHERE deleted_at IS NULL ORDER BY full_name ASC');
-    const carsResult = await pool.query('SELECT * FROM cars ORDER BY car_id ASC');
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 25));
+    const search = String(req.query.search || '').trim();
+    const offset = (page - 1) * limit;
 
-    // Group cars by member_id
-    const carsMap = {};
-    for (const car of carsResult.rows) {
-      if (!carsMap[car.member_id]) carsMap[car.member_id] = [];
-      carsMap[car.member_id].push(car);
+    const params = [];
+    let where = 'm.deleted_at IS NULL';
+    if (search) {
+      params.push(`%${search}%`);
+      where += ` AND (m.full_name ILIKE $1 OR EXISTS (
+                   SELECT 1 FROM cars c
+                    WHERE c.member_id = m.member_id
+                      AND (c.car_plate ILIKE $1 OR c.car_model ILIKE $1)))`;
     }
 
-    const members = membersResult.rows.map(m => ({
-      ...m,
-      cars: carsMap[m.member_id] || [],
-    }));
+    const countQ = await pool.query(`SELECT COUNT(*)::int AS total FROM members m WHERE ${where}`, params);
+    const total = countQ.rows[0].total;
+    const totalPages = Math.max(1, Math.ceil(total / limit));
 
-    res.json(members);
+    const membersResult = await pool.query(
+      `SELECT m.* FROM members m WHERE ${where}
+        ORDER BY m.full_name ASC
+        LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    );
+
+    // Cars for just this page's members.
+    const ids = membersResult.rows.map(m => m.member_id);
+    const carsMap = {};
+    if (ids.length > 0) {
+      const carsResult = await pool.query(
+        'SELECT * FROM cars WHERE member_id = ANY($1) ORDER BY car_id ASC',
+        [ids]
+      );
+      for (const car of carsResult.rows) {
+        (carsMap[car.member_id] ||= []).push(car);
+      }
+    }
+
+    const members = membersResult.rows.map(m => ({ ...m, cars: carsMap[m.member_id] || [] }));
+    res.json({ members, total, page, limit, totalPages });
   } catch (err) {
     console.error('GET /api/members error:', err.message);
     res.status(500).json({ error: err.message });

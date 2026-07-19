@@ -1994,6 +1994,12 @@ export default function App() {
   const [adjustments, setAdjustments] = useState({});
   const [descriptions, setDescriptions] = useState({});
   const [searchQuery, setSearchQuery] = useState('');
+  // Server-side pagination: the list is fetched one page at a time so the
+  // dashboard stays fast no matter how many customers there are.
+  const PAGE_SIZE = 25;
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [totalCount, setTotalCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [registering, setRegistering] = useState(false);
   const [returningInfo, setReturningInfo] = useState(null); // returning-vehicle confirm gate
@@ -2014,14 +2020,48 @@ export default function App() {
     localStorage.setItem('carshop_theme', next);
   };
 
-  const fetchMembers = useCallback(() => {
+  const fetchMembers = useCallback((pageArg, searchArg) => {
+    const p = pageArg ?? 1;
+    const q = searchArg ?? '';
     setLoading(true);
     const wakeTimer = setTimeout(() => setServerWaking(true), 4000);
-    apiFetch('/api/members')
-      .then(data => { if (Array.isArray(data)) setMembers(data); })
+    apiFetch(`/api/members?page=${p}&limit=${PAGE_SIZE}&search=${encodeURIComponent(q)}`)
+      .then(data => {
+        if (data && Array.isArray(data.members)) {
+          setMembers(data.members);
+          setTotalPages(data.totalPages || 1);
+          setTotalCount(data.total || 0);
+          // If the page emptied out (e.g. last member on it was deleted), step back.
+          if (data.members.length === 0 && p > 1) {
+            setPage(p - 1);
+          }
+        }
+      })
       .catch(() => toast('Could not reach server. Render may be waking up — try again in 15s.', 'error'))
       .finally(() => { setLoading(false); clearTimeout(wakeTimer); setServerWaking(false); });
   }, []);
+
+  // Keep the latest page/search in a ref so socket handlers and callbacks can
+  // refetch the CURRENT view without re-subscribing on every change.
+  const viewRef = React.useRef({ page: 1, search: '' });
+  useEffect(() => { viewRef.current = { page, search: searchQuery }; }, [page, searchQuery]);
+  const refetchCurrentPage = useCallback(() => {
+    fetchMembers(viewRef.current.page, viewRef.current.search);
+  }, [fetchMembers]);
+
+  // Debounce typing in the search box (300ms), then search server-side from page 1.
+  const searchDebounce = React.useRef(null);
+  const isFirstSearch = React.useRef(true);
+  useEffect(() => {
+    if (!authed) return;
+    if (isFirstSearch.current) { isFirstSearch.current = false; return; } // initial load handled below
+    clearTimeout(searchDebounce.current);
+    searchDebounce.current = setTimeout(() => {
+      setPage(1);
+      fetchMembers(1, searchQuery);
+    }, 300);
+    return () => clearTimeout(searchDebounce.current);
+  }, [searchQuery, authed, fetchMembers]);
 
   useEffect(() => {
     _onUnauthorized = () => setAuthed(false);
@@ -2030,7 +2070,7 @@ export default function App() {
       socket.disconnect(); // no listening while logged out
       return;
     }
-    fetchMembers();
+    // (Initial members fetch happens in the page-change effect below.)
     apiFetch('/api/me')
       .then(me => { setPermissions(me.permissions); setUserRole(me.role); setUserName(me.username); setUserId(me.id); })
       .catch(() => {});
@@ -2044,7 +2084,10 @@ export default function App() {
     socket.on('pointsUpdated', ({ memberId, newTotal }) => {
       setMembers(prev => prev.map(m => m.member_id == memberId ? { ...m, total_points: newTotal } : m));
     });
-    socket.on('memberAdded', (newMember) => setMembers(prev => [...prev, newMember]));
+    // Under pagination, adding/removing a member can change which rows belong
+    // on this page — refetch the current view instead of splicing the array.
+    socket.on('memberAdded', () => refetchCurrentPage());
+    socket.on('memberDeleted', () => refetchCurrentPage());
     socket.on('memberFrozen', ({ memberId }) => {
       setMembers(prev => prev.map(m => m.member_id == memberId ? { ...m, is_frozen: true } : m));
     });
@@ -2063,7 +2106,6 @@ export default function App() {
         return prev;
       });
     });
-    socket.on('memberDeleted', ({ memberId }) => setMembers(prev => prev.filter(m => m.member_id != memberId)));
     socket.on('carAdded', ({ memberId, car }) => {
       setMembers(prev => prev.map(m => m.member_id === memberId ? { ...m, cars: [...(m.cars || []), car] } : m));
     });
@@ -2088,7 +2130,7 @@ export default function App() {
       socket.off('carAdded'); socket.off('carDeleted'); socket.off('transactionAdded');
       socket.disconnect();
     };
-  }, [fetchMembers, authed]);
+  }, [refetchCurrentPage, authed]);
 
   const doRegister = async () => {
     setRegistering(true);
@@ -2240,18 +2282,15 @@ export default function App() {
     setMembers(prev => prev.map(m => m.member_id === memberId ? { ...m, cars: (m.cars || []).filter(c => c.car_id !== carId) } : m));
   };
 
-  const filteredMembers = members
-    .filter(m => {
-      if (!m.full_name) return false;
-      const q = searchQuery.toLowerCase();
-      const nameMatch = m.full_name.toLowerCase().includes(q);
-      const carMatch = (m.cars || []).some(c =>
-        (c.car_plate && c.car_plate.toLowerCase().includes(q)) ||
-        (c.car_model && c.car_model.toLowerCase().includes(q))
-      );
-      return nameMatch || carMatch;
-    })
-    .sort((a, b) => a.full_name.localeCompare(b.full_name));
+  // Search and paging happen server-side now; the list arrives pre-filtered.
+  const filteredMembers = [...members].sort((a, b) => (a.full_name || '').localeCompare(b.full_name || ''));
+
+  // Fetch on page change (search changes are handled by the debounce effect).
+  useEffect(() => {
+    if (!authed) return;
+    fetchMembers(page, viewRef.current.search);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, authed]);
 
   if (!authed) {
     return (
@@ -2295,7 +2334,7 @@ export default function App() {
       {showTelegram && <TelegramModal onClose={() => setShowTelegram(false)} theme={theme} />}
       {showVehicleLookup && <VehicleLookupModal onClose={() => setShowVehicleLookup(false)} theme={theme} />}
       {showStaffPanel && isAdmin && <StaffPanel theme={theme} currentUserId={userId} currentUserRole={userRole} onClose={() => setShowStaffPanel(false)} />}
-      {showTrash && can('can_delete_member') && <TrashPanel theme={theme} onClose={() => setShowTrash(false)} onRestored={fetchMembers} />}
+      {showTrash && can('can_delete_member') && <TrashPanel theme={theme} onClose={() => setShowTrash(false)} onRestored={refetchCurrentPage} />}
 
       <div style={{ maxWidth: 900, margin: '0 auto', padding: '40px 20px', fontFamily: "'JetBrains Mono', monospace" }}>
 
@@ -2310,7 +2349,7 @@ export default function App() {
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 10 }}>
             <ThemeToggle theme={theme} themeName={themeName} onToggle={toggleTheme} />
             <StatusBadge connected={connected} />
-            <span style={{ fontSize: 11, color: theme.textFaint }}>{filteredMembers.length} member{filteredMembers.length !== 1 ? 's' : ''}</span>
+            <span style={{ fontSize: 11, color: theme.textFaint }}>{totalCount} member{totalCount !== 1 ? 's' : ''}{totalPages > 1 ? ` · page ${page}/${totalPages}` : ''}</span>
             <span style={{ fontSize: 11, color: theme.textDim }}>
               {userName} · <span style={{ color: isMaster ? '#a78bfa' : userRole === 'Admin' ? '#f59e0b' : theme.accent }}>{userRole}</span>
             </span>
@@ -2515,6 +2554,27 @@ export default function App() {
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* Pagination controls */}
+        {totalPages > 1 && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14, marginTop: 24 }}>
+            <button
+              onClick={() => setPage(p => Math.max(1, p - 1))}
+              disabled={page <= 1 || loading}
+              style={{ background: 'none', border: `1px solid ${theme.border}`, color: page <= 1 ? theme.textFaint : theme.text, borderRadius: 8, padding: '7px 16px', cursor: page <= 1 || loading ? 'default' : 'pointer', fontSize: 12, fontFamily: "'JetBrains Mono', monospace", opacity: page <= 1 ? 0.5 : 1 }}>
+              ← Prev
+            </button>
+            <span style={{ fontSize: 12, color: theme.textDim, fontFamily: "'JetBrains Mono', monospace", letterSpacing: 1 }}>
+              Page {page} of {totalPages}
+            </span>
+            <button
+              onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+              disabled={page >= totalPages || loading}
+              style={{ background: 'none', border: `1px solid ${theme.border}`, color: page >= totalPages ? theme.textFaint : theme.text, borderRadius: 8, padding: '7px 16px', cursor: page >= totalPages || loading ? 'default' : 'pointer', fontSize: 12, fontFamily: "'JetBrains Mono', monospace", opacity: page >= totalPages ? 0.5 : 1 }}>
+              Next →
+            </button>
           </div>
         )}
 
