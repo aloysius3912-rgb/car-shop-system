@@ -98,7 +98,10 @@ async function ensureAuthTables() {
   `);
   // Challenges double as password-reset PINs; purpose keeps the two flows
   // strictly separate (a reset PIN can't complete a login and vice versa).
+  // pin_verified marks a reset challenge whose PIN has been accepted, gating
+  // the set-new-password step.
   await pool.query(`ALTER TABLE login_challenges ADD COLUMN IF NOT EXISTS purpose TEXT DEFAULT 'login';`);
+  await pool.query(`ALTER TABLE login_challenges ADD COLUMN IF NOT EXISTS pin_verified BOOLEAN DEFAULT false;`);
   // Seed default owner accounts on first run (temp password from env or 'changeme-now').
   const count = await pool.query('SELECT COUNT(*) FROM staff_users');
   if (parseInt(count.rows[0].count) === 0) {
@@ -1784,21 +1787,30 @@ app.post('/api/forgot-password', loginRateLimiter, async (req, res) => {
   }
 });
 
-// ── Forgot password, step 2: verify the PIN and set the new password (public) ──
-app.post('/api/forgot-password/verify', loginRateLimiter, async (req, res) => {
-  const { challengeToken, pin, newPassword } = req.body || {};
+// Password policy for resets: min 10 chars with at least one uppercase,
+// one lowercase, and one special character. Returns null if OK, else the
+// specific requirement that failed (so the user knows exactly what to fix).
+function passwordPolicyError(pw) {
+  const s = String(pw || '');
+  if (s.length < 10) return 'Password must be at least 10 characters.';
+  if (!/[A-Z]/.test(s)) return 'Password must include at least one uppercase letter.';
+  if (!/[a-z]/.test(s)) return 'Password must include at least one lowercase letter.';
+  if (!/[^A-Za-z0-9]/.test(s)) return 'Password must include at least one special character (e.g. ! @ # $ %).';
+  return null;
+}
+
+// ── Forgot password, step 2: verify the PIN only (public) ──
+// On success the challenge is marked pin_verified but NOT burned — the user
+// then sets the new password in step 3 against the same challenge token.
+app.post('/api/forgot-password/verify-pin', loginRateLimiter, async (req, res) => {
+  const { challengeToken, pin } = req.body || {};
   if (!challengeToken || !/^\d{4}$/.test(String(pin || ''))) {
     return res.status(400).json({ error: 'Enter the 4-digit PIN.' });
   }
-  if (!newPassword || String(newPassword).length < 10) {
-    return res.status(400).json({ error: 'New password must be at least 10 characters.' });
-  }
   try {
     const result = await pool.query(
-      `SELECT c.challenge_token, c.staff_id, c.pin_hash, c.attempts, c.expires_at,
-              u.username, u.telegram_chat_id
+      `SELECT c.challenge_token, c.attempts, c.expires_at, c.pin_hash
          FROM login_challenges c
-         JOIN staff_users u ON u.id = c.staff_id
         WHERE c.challenge_token = $1
           AND COALESCE(c.purpose, 'login') = 'reset'`,
       [challengeToken]
@@ -1825,8 +1837,44 @@ app.post('/api/forgot-password/verify', loginRateLimiter, async (req, res) => {
       return res.status(401).json({ error: `Wrong PIN. ${left} attempt${left !== 1 ? 's' : ''} left.` });
     }
 
-    // PIN verified: burn the challenge, set the new password, kill all existing
-    // sessions for the account (anyone holding an old session is logged out).
+    // PIN accepted: unlock the set-password step for this challenge.
+    await pool.query('UPDATE login_challenges SET pin_verified = true WHERE challenge_token = $1', [challengeToken]);
+    res.json({ success: true, pinVerified: true });
+  } catch (err) {
+    console.error('POST /api/forgot-password/verify-pin error:', err.message);
+    res.status(500).json({ error: 'Could not verify PIN. Please try again.' });
+  }
+});
+
+// ── Forgot password, step 3: set the new password (public) ──
+// Only works on a challenge whose PIN was verified in step 2 and which hasn't
+// expired. Burns the challenge, updates the hash, kills all sessions.
+app.post('/api/forgot-password/complete', loginRateLimiter, async (req, res) => {
+  const { challengeToken, newPassword } = req.body || {};
+  if (!challengeToken) return res.status(400).json({ error: 'Missing reset session. Please start again.' });
+  const policyErr = passwordPolicyError(newPassword);
+  if (policyErr) return res.status(400).json({ error: policyErr });
+  try {
+    const result = await pool.query(
+      `SELECT c.challenge_token, c.staff_id, c.expires_at, c.pin_verified,
+              u.username, u.telegram_chat_id
+         FROM login_challenges c
+         JOIN staff_users u ON u.id = c.staff_id
+        WHERE c.challenge_token = $1
+          AND COALESCE(c.purpose, 'login') = 'reset'`,
+      [challengeToken]
+    );
+    const ch = result.rows[0];
+
+    if (!ch || new Date(ch.expires_at) <= new Date()) {
+      if (ch) await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
+      return res.status(401).json({ error: 'Reset session expired. Please start again.', restart: true });
+    }
+    if (!ch.pin_verified) {
+      return res.status(401).json({ error: 'Verify the PIN first.', restart: true });
+    }
+
+    // Burn the challenge, set the new password, kill all existing sessions.
     await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]);
     const hash = await bcrypt.hash(String(newPassword), 12);
     await pool.query('UPDATE staff_users SET password_hash = $1 WHERE id = $2', [hash, ch.staff_id]);
@@ -1837,7 +1885,7 @@ app.post('/api/forgot-password/verify', loginRateLimiter, async (req, res) => {
 
     res.json({ success: true, message: 'Password changed. You can now log in with your new password.' });
   } catch (err) {
-    console.error('POST /api/forgot-password/verify error:', err.message);
+    console.error('POST /api/forgot-password/complete error:', err.message);
     res.status(500).json({ error: 'Could not reset the password. Please try again.' });
   }
 });
@@ -1862,7 +1910,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
 
 app.use('/api', async (req, res, next) => {
   if (req.path === '/login' || req.path === '/login/verify-2fa'
-      || req.path === '/forgot-password' || req.path === '/forgot-password/verify') return next();
+      || req.path === '/forgot-password' || req.path === '/forgot-password/verify-pin'
+      || req.path === '/forgot-password/complete') return next();
   try {
     const user = await getSessionUser(req.headers['x-admin-token']);
     if (!user) {
