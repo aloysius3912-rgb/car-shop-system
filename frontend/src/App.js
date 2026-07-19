@@ -2557,23 +2557,55 @@ export default function App() {
           </div>
         )}
 
-        {/* Pagination controls */}
+        {/* Pagination controls: Prev · 1 2 3 · Next */}
         {totalPages > 1 && (
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 14, marginTop: 24 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 24, flexWrap: 'wrap' }}>
             <button
               onClick={() => setPage(p => Math.max(1, p - 1))}
               disabled={page <= 1 || loading}
-              style={{ background: 'none', border: `1px solid ${theme.border}`, color: page <= 1 ? theme.textFaint : theme.text, borderRadius: 8, padding: '7px 16px', cursor: page <= 1 || loading ? 'default' : 'pointer', fontSize: 12, fontFamily: "'JetBrains Mono', monospace", opacity: page <= 1 ? 0.5 : 1 }}>
-              ← Prev
+              style={{ background: 'none', border: `1px solid ${theme.border}`, color: page <= 1 ? theme.textFaint : theme.text, borderRadius: 8, padding: '7px 14px', cursor: page <= 1 || loading ? 'default' : 'pointer', fontSize: 12, fontFamily: "'JetBrains Mono', monospace", opacity: page <= 1 ? 0.5 : 1 }}>
+              Prev
             </button>
-            <span style={{ fontSize: 12, color: theme.textDim, fontFamily: "'JetBrains Mono', monospace", letterSpacing: 1 }}>
-              Page {page} of {totalPages}
-            </span>
+            {(() => {
+              // Which numbers to show: all pages when few; otherwise a window
+              // around the current page with first/last always visible.
+              const nums = [];
+              if (totalPages <= 7) {
+                for (let i = 1; i <= totalPages; i++) nums.push(i);
+              } else {
+                nums.push(1);
+                const lo = Math.max(2, page - 1);
+                const hi = Math.min(totalPages - 1, page + 1);
+                if (lo > 2) nums.push('…');
+                for (let i = lo; i <= hi; i++) nums.push(i);
+                if (hi < totalPages - 1) nums.push('…');
+                nums.push(totalPages);
+              }
+              return nums.map((n, idx) => n === '…' ? (
+                <span key={`gap-${idx}`} style={{ color: theme.textFaint, fontSize: 12, fontFamily: "'JetBrains Mono', monospace", padding: '0 2px' }}>…</span>
+              ) : (
+                <button
+                  key={n}
+                  onClick={() => setPage(n)}
+                  disabled={loading || n === page}
+                  style={{
+                    background: n === page ? theme.accent : 'none',
+                    border: `1px solid ${n === page ? theme.accent : theme.border}`,
+                    color: n === page ? theme.bg : theme.text,
+                    borderRadius: 8, padding: '7px 12px', minWidth: 36,
+                    cursor: loading || n === page ? 'default' : 'pointer',
+                    fontSize: 12, fontFamily: "'JetBrains Mono', monospace",
+                    fontWeight: n === page ? 700 : 400,
+                  }}>
+                  {n}
+                </button>
+              ));
+            })()}
             <button
               onClick={() => setPage(p => Math.min(totalPages, p + 1))}
               disabled={page >= totalPages || loading}
-              style={{ background: 'none', border: `1px solid ${theme.border}`, color: page >= totalPages ? theme.textFaint : theme.text, borderRadius: 8, padding: '7px 16px', cursor: page >= totalPages || loading ? 'default' : 'pointer', fontSize: 12, fontFamily: "'JetBrains Mono', monospace", opacity: page >= totalPages ? 0.5 : 1 }}>
-              Next →
+              style={{ background: 'none', border: `1px solid ${theme.border}`, color: page >= totalPages ? theme.textFaint : theme.text, borderRadius: 8, padding: '7px 14px', cursor: page >= totalPages || loading ? 'default' : 'pointer', fontSize: 12, fontFamily: "'JetBrains Mono', monospace", opacity: page >= totalPages ? 0.5 : 1 }}>
+              Next
             </button>
           </div>
         )}
