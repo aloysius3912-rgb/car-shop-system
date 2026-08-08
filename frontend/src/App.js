@@ -816,7 +816,7 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit
 // ── Google Sign-In config ──
 // Set this to the OAuth Client ID from Google Cloud Console (see deploy
 // notes). It must match the GOOGLE_CLIENT_ID configured on the backend.
-const GOOGLE_CLIENT_ID = 'REPLACE_WITH_YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
+const GOOGLE_CLIENT_ID = '547892507710-ul6765sf9rli3dhi0r9l27jnjphv2d5t.apps.googleusercontent.com';
 
 // Loads the Google Identity Services script once, on demand, and resolves
 // once window.google.accounts.id is ready. Safe to call more than once.
