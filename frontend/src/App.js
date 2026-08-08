@@ -185,65 +185,15 @@ function ConfirmDialog({ title, message, onConfirm, onCancel, theme, confirmLabe
   );
 }
 
-// ── Change password modal ──
-function ChangePasswordModal({ onClose, theme }) {
-  const [currentPassword, setCurrentPassword] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
-
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setError('');
-    if (newPassword.length < 10) { setError('New password must be at least 10 characters.'); return; }
-    if (newPassword !== confirmPassword) { setError('New passwords do not match.'); return; }
-    setLoading(true);
-    try {
-      const data = await apiFetch('/api/change-password', {
-        method: 'POST',
-        body: JSON.stringify({ currentPassword, newPassword }),
-      });
-      localStorage.setItem('carshop_token', data.token);
-      toast('Password changed successfully!');
-      onClose();
-    } catch (err) {
-      setError(err.message || 'Could not change password.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 8888 }}>
-      <form onSubmit={handleSubmit} style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '32px 36px', maxWidth: 380, width: '90%', fontFamily: "'JetBrains Mono', monospace" }}>
-        <h3 style={{ color: theme.text, margin: '0 0 18px', fontSize: 18, fontFamily: "'Space Grotesk', sans-serif" }}>Change Password</h3>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 14 }}>
-          <input type="password" placeholder="Current password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} required autoFocus style={inputStyle(theme, { width: '100%' })} />
-          <input type="password" placeholder="New password" value={newPassword} onChange={e => setNewPassword(e.target.value)} required style={inputStyle(theme, { width: '100%' })} />
-          <input type="password" placeholder="Retype new password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} required style={inputStyle(theme, { width: '100%' })} />
-        </div>
-        {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
-        <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
-          <button type="button" onClick={onClose} style={btnStyle('#374151', '#fff')}>Cancel</button>
-          <button type="submit" disabled={loading} style={{ ...btnStyle(theme.accent, theme.bg), opacity: loading ? 0.6 : 1 }}>
-            {loading ? 'Saving…' : 'Save Password'}
-          </button>
-        </div>
-      </form>
-    </div>
-  );
-}
-
-// ── Telegram 2FA modal (link / unlink, per staff member) ──
+// ── Telegram bot link modal (link / unlink, per staff member) ──
+// This is now purely for using staff bot commands (/customer, /leaderboard,
+// etc.) and Master fraud alerts — it has nothing to do with login anymore.
 function TelegramModal({ onClose, theme }) {
   const [status, setStatus] = useState(null); // { botConfigured, linked, pendingCode }
   const [loading, setLoading] = useState(true);
   const [code, setCode] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [unlinkPassword, setUnlinkPassword] = useState('');
-  const [showUnlink, setShowUnlink] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -278,7 +228,7 @@ function TelegramModal({ onClose, theme }) {
     setError('');
     try {
       await apiFetch('/api/telegram/confirm-link', { method: 'POST' });
-      toast('Telegram linked! You\'ll get a PIN on every login.');
+      toast('Telegram linked! You can now use bot commands.');
       setCode(null);
       load();
     } catch (err) {
@@ -289,17 +239,12 @@ function TelegramModal({ onClose, theme }) {
   };
 
   const unlink = async () => {
-    if (!unlinkPassword) { setError('Enter your password to unlink.'); return; }
+    if (!window.confirm('Unlink Telegram? You will no longer be able to use bot commands until you re-link.')) return;
     setBusy(true);
     setError('');
     try {
-      await apiFetch('/api/telegram/unlink', {
-        method: 'POST',
-        body: JSON.stringify({ password: unlinkPassword }),
-      });
-      toast('Telegram 2FA disabled for your account.', 'warn');
-      setShowUnlink(false);
-      setUnlinkPassword('');
+      await apiFetch('/api/telegram/unlink', { method: 'POST' });
+      toast('Telegram unlinked.', 'warn');
       load();
     } catch (err) {
       setError(err.message || 'Could not unlink Telegram.');
@@ -316,7 +261,7 @@ function TelegramModal({ onClose, theme }) {
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 8888, padding: 20 }}>
       <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '32px 36px', maxWidth: 420, width: '100%', fontFamily: "'JetBrains Mono', monospace" }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
-          <h3 style={{ color: theme.text, margin: 0, fontSize: 18, fontFamily: "'Space Grotesk', sans-serif" }}>Telegram 2FA</h3>
+          <h3 style={{ color: theme.text, margin: 0, fontSize: 18, fontFamily: "'Space Grotesk', sans-serif" }}>Telegram Bot</h3>
           <button onClick={onClose} style={btnStyle('#374151', '#fff', { padding: '6px 14px' })}>Close</button>
         </div>
 
@@ -331,31 +276,12 @@ function TelegramModal({ onClose, theme }) {
             {sectionLabel('Status')}
             <p style={{ color: '#10b981', fontSize: 14, fontWeight: 700, marginBottom: 6 }}>✓ Linked</p>
             <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.6, marginBottom: 20 }}>
-              Every login now requires a 4-digit PIN sent to your Telegram.
+              You can use staff bot commands (send /help to the bot to see the list).
             </p>
-            {showUnlink ? (
-              <>
-                {sectionLabel('Confirm with your password')}
-                <input type="password" placeholder="Your password" value={unlinkPassword}
-                  onChange={e => setUnlinkPassword(e.target.value)} autoFocus
-                  style={inputStyle(theme, { width: '100%', marginBottom: 12 })} />
-                {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 12 }}>{error}</div>}
-                <div style={{ display: 'flex', gap: 10 }}>
-                  <button onClick={unlink} disabled={busy} style={{ ...btnStyle('#ef4444', '#fff'), opacity: busy ? 0.6 : 1 }}>
-                    {busy ? 'Unlinking…' : 'Disable 2FA'}
-                  </button>
-                  <button onClick={() => { setShowUnlink(false); setUnlinkPassword(''); setError(''); }} style={btnStyle('#374151', '#fff')}>Cancel</button>
-                </div>
-              </>
-            ) : status.required ? (
-              <p style={{ color: theme.textFaint, fontSize: 12, lineHeight: 1.6 }}>
-                2FA is required on your account by an Admin and can't be disabled here.
-              </p>
-            ) : (
-              <button onClick={() => setShowUnlink(true)} style={btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455' })}>
-                Unlink Telegram
-              </button>
-            )}
+            {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 12 }}>{error}</div>}
+            <button onClick={unlink} disabled={busy} style={{ ...btnStyle('#ef444422', '#ef4444', { border: '1px solid #ef444455' }), opacity: busy ? 0.6 : 1 }}>
+              {busy ? 'Unlinking…' : 'Unlink Telegram'}
+            </button>
           </>
         ) : code ? (
           <>
@@ -364,7 +290,7 @@ function TelegramModal({ onClose, theme }) {
               <span style={{ fontSize: 26, fontWeight: 700, letterSpacing: 4, color: theme.accent }}>{code}</span>
             </div>
             <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.7, marginBottom: 16 }}>
-              1. Open Telegram and find the shop's login bot.<br />
+              1. Open Telegram and find the shop's bot.<br />
               2. Press <span style={{ color: theme.text }}>Start</span>, then send the code above as a message.<br />
               3. Come back here and press <span style={{ color: theme.text }}>Confirm Link</span>.
             </p>
@@ -380,11 +306,11 @@ function TelegramModal({ onClose, theme }) {
           <>
             {sectionLabel('Status')}
             <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.6, marginBottom: 20 }}>
-              Not linked. Once linked, logging in will require a 4-digit PIN sent to your Telegram — protecting the account even if the password leaks.
+              Not linked. Linking lets you use staff bot commands from Telegram (customer lookups, reports, etc.) — it's optional and separate from logging in.
             </p>
             {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 12 }}>{error}</div>}
             <button onClick={generateCode} disabled={busy} style={{ ...btnStyle(theme.accent, theme.bg), opacity: busy ? 0.6 : 1 }}>
-              {busy ? 'Generating…' : 'Enable Telegram 2FA'}
+              {busy ? 'Generating…' : 'Link Telegram'}
             </button>
           </>
         )}
@@ -392,6 +318,7 @@ function TelegramModal({ onClose, theme }) {
     </div>
   );
 }
+
 
 // ── Points panel with earn/redeem tabs ──
 function PointsPanel({ memberId, theme, cars = [], pointsValue, descriptionValue, onPointsChange, onDescriptionChange, onApply, canAdd = true, canDeduct = true }) {
@@ -886,378 +813,88 @@ function HistoryDrawer({ memberId, isOpen, transactions, loading, theme, canEdit
   );
 }
 
-// ── Login screen (username/password, then optional Telegram PIN step) ──
+// ── Google Sign-In config ──
+// Set this to the OAuth Client ID from Google Cloud Console (see deploy
+// notes). It must match the GOOGLE_CLIENT_ID configured on the backend.
+const GOOGLE_CLIENT_ID = 'REPLACE_WITH_YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
+
+// Loads the Google Identity Services script once, on demand, and resolves
+// once window.google.accounts.id is ready. Safe to call more than once.
+let _gisPromise = null;
+function loadGoogleIdentityServices() {
+  if (_gisPromise) return _gisPromise;
+  _gisPromise = new Promise((resolve, reject) => {
+    if (window.google?.accounts?.id) return resolve(window.google);
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve(window.google);
+    script.onerror = () => reject(new Error('Could not load Google Sign-In. Check your connection.'));
+    document.head.appendChild(script);
+  });
+  return _gisPromise;
+}
+
+// ── Login screen (Google Sign-In only) ──
 function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
-  // 2FA: when the server answers requires2fa, we hold the challenge token
-  // and switch to the PIN screen.
-  const [challengeToken, setChallengeToken] = useState(null);
-  const [pin, setPin] = useState('');
-  const [verifying, setVerifying] = useState(false);
-  // Forgot-password flow: 'request' (username) → 'pin' (verify PIN)
-  // → 'password' (set the new password once the PIN is accepted)
-  const [forgotMode, setForgotMode] = useState(null);
-  const [resetToken, setResetToken] = useState(null);
-  const [resetPin, setResetPin] = useState('');
-  const [newPw, setNewPw] = useState('');
-  const [newPw2, setNewPw2] = useState('');
-  const [notice, setNotice] = useState('');
-
-  // Mirror of the server's password policy, for instant feedback.
-  const pwChecks = [
-    { label: 'At least 10 characters', ok: newPw.length >= 10 },
-    { label: 'One uppercase letter (A–Z)', ok: /[A-Z]/.test(newPw) },
-    { label: 'One lowercase letter (a–z)', ok: /[a-z]/.test(newPw) },
-    { label: 'One special character (! @ # $ …)', ok: /[^A-Za-z0-9]/.test(newPw) },
-  ];
-  const pwOk = pwChecks.every(c => c.ok);
-
-  const startForgot = () => {
-    setForgotMode('request'); setResetToken(null); setResetPin('');
-    setNewPw(''); setNewPw2(''); setError(''); setNotice('');
-  };
-  const exitForgot = () => {
-    setForgotMode(null); setResetToken(null); setResetPin('');
-    setNewPw(''); setNewPw2(''); setError(''); setNotice('');
-  };
-
-  const requestReset = async (e) => {
-    e.preventDefault();
-    if (!username.trim()) { setError('Enter your username first.'); return; }
-    setError(''); setLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/forgot-password`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: username.trim() }),
-      });
-      const data = await res.json();
-      if (res.ok && data.challengeToken) {
-        setResetToken(data.challengeToken);
-        setForgotMode('pin');
-        setResetPin('');
-        setNotice('');
-      } else if (res.ok) {
-        // Generic answer (account unknown or no Telegram linked) — stay here.
-        setNotice(data.message || 'If that account has Telegram linked, a PIN has been sent.');
-      } else {
-        setError(data.error || 'Could not start the reset.');
-      }
-    } catch {
-      setError('Could not reach server. Try again in a moment.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Step 2: PIN only — the password screen unlocks after this succeeds.
-  const verifyResetPin = async (pinValue) => {
-    if (verifying) return;
-    setError(''); setVerifying(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/forgot-password/verify-pin`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ challengeToken: resetToken, pin: pinValue }),
-      });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setForgotMode('password');
-        setError('');
-      } else {
-        setError(data.error || 'Wrong PIN.');
-        setResetPin('');
-        if (data.restart) { setForgotMode('request'); setResetToken(null); }
-      }
-    } catch {
-      setError('Could not reach server. Try again in a moment.');
-      setResetPin('');
-    } finally {
-      setVerifying(false);
-    }
-  };
-
-  const handleResetPinChange = (raw) => {
-    const digits = raw.replace(/\D/g, '').slice(0, 4);
-    setResetPin(digits);
-    if (digits.length === 4) verifyResetPin(digits); // auto-submit on 4th digit
-  };
-
-  // Step 3: set the new password against the PIN-verified challenge.
-  const submitNewPassword = async (e) => {
-    e.preventDefault();
-    if (!pwOk) { setError('Password does not meet all the requirements below.'); return; }
-    if (newPw !== newPw2) { setError('Passwords do not match.'); return; }
-    setError(''); setVerifying(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/forgot-password/complete`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ challengeToken: resetToken, newPassword: newPw }),
-      });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        exitForgot();
-        setPassword('');
-        setNotice('Password changed — log in with your new password.');
-      } else {
-        setError(data.error || 'Could not reset the password.');
-        if (data.restart) { setForgotMode('request'); setResetToken(null); setResetPin(''); }
-      }
-    } catch {
-      setError('Could not reach server. Try again in a moment.');
-    } finally {
-      setVerifying(false);
-    }
-  };
+  const [gisReady, setGisReady] = useState(false);
+  const buttonRef = React.useRef(null);
 
   const finishLogin = (data) => {
     localStorage.setItem('carshop_token', data.token);
     localStorage.setItem('carshop_role', data.role);
     localStorage.setItem('carshop_username', data.username);
-    onSuccess({ role: data.role, username: data.username, mustLink2fa: !!data.mustLink2fa });
+    onSuccess({ role: data.role, username: data.username });
   };
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
+  const handleCredentialResponse = useCallback(async (response) => {
     setError('');
     setLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/api/login`, {
+      const res = await fetch(`${API_BASE}/api/login/google`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({ credential: response.credential }),
       });
       const data = await res.json();
-      if (res.ok && data.requires2fa) {
-        // Password OK — now wait for the Telegram PIN.
-        setChallengeToken(data.challengeToken);
-        setPin('');
-      } else if (res.ok && data.success) {
+      if (res.ok && data.success) {
         finishLogin(data);
       } else {
-        setError(data.error || 'Incorrect username or password');
+        setError(data.error || 'Sign-in failed.');
       }
     } catch (err) {
       setError('Could not reach server. Try again in a moment.');
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  const verifyPin = async (pinValue) => {
-    if (verifying) return;
-    setError('');
-    setVerifying(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/login/verify-2fa`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ challengeToken, pin: pinValue }),
-      });
-      const data = await res.json();
-      if (res.ok && data.success) {
-        finishLogin(data);
-      } else {
-        setError(data.error || 'Wrong PIN.');
-        setPin('');
-        // Expired or locked-out challenge → back to username/password.
-        if (data.restart) setChallengeToken(null);
-      }
-    } catch (err) {
-      setError('Could not reach server. Try again in a moment.');
-      setPin('');
-    } finally {
-      setVerifying(false);
-    }
-  };
-
-  const handlePinChange = (raw) => {
-    const digits = raw.replace(/\D/g, '').slice(0, 4);
-    setPin(digits);
-    if (digits.length === 4) verifyPin(digits); // auto-submit on 4th digit
-  };
-
-  const backToLogin = () => {
-    setChallengeToken(null);
-    setPin('');
-    setError('');
-  };
-
-  // ── Forgot password: step 1 (request PIN) ──
-  if (forgotMode === 'request') {
-    return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'JetBrains Mono', monospace", background: theme.bg, padding: 20, transition: 'background 0.2s ease' }}>
-        <style>{`
-          @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@600;700;800&display=swap');
-          @keyframes spin { to { transform: rotate(360deg); } }
-        `}</style>
-        <div style={{ position: 'fixed', top: 20, right: 20 }}>
-          <ThemeToggle theme={theme} themeName={themeName} onToggle={onToggleTheme} />
-        </div>
-        <form onSubmit={requestReset} style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '40px 36px', maxWidth: 360, width: '100%', textAlign: 'center' }}>
-          <div style={{ fontSize: 11, letterSpacing: 4, color: theme.accent, marginBottom: 6, textTransform: 'uppercase' }}>Password Reset</div>
-          <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 24, color: theme.text, fontWeight: 800, marginBottom: 10, letterSpacing: -0.5 }}>
-            Forgot Password
-          </h1>
-          <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.5, marginBottom: 20 }}>
-            Enter your username. If your account has Telegram 2FA linked, a 4-digit PIN will be sent there to verify it's you.
-          </p>
-          <input type="text" placeholder="Username" value={username} onChange={e => setUsername(e.target.value)} autoFocus autoCapitalize="none"
-            style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 16, marginBottom: 14 })} />
-          {notice && <div style={{ color: theme.accent, fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>{notice}</div>}
-          {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
-          <button type="submit" disabled={loading} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: loading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
-            {loading && <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />}
-            {loading ? 'Sending…' : 'Send Reset PIN'}
-          </button>
-          <p style={{ color: theme.textFaint, fontSize: 11, lineHeight: 1.5, marginBottom: 12 }}>
-            No Telegram linked? Ask a Master to reset your password from the Staff panel.
-          </p>
-          <button type="button" onClick={exitForgot} style={{ background: 'none', border: 'none', color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, cursor: 'pointer', letterSpacing: 1 }}>
-            ← Back to login
-          </button>
-        </form>
-      </div>
-    );
-  }
-
-  // ── Forgot password: step 2 (verify PIN only) ──
-  if (forgotMode === 'pin') {
-    return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'JetBrains Mono', monospace", background: theme.bg, padding: 20, transition: 'background 0.2s ease' }}>
-        <style>{`
-          @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@600;700;800&display=swap');
-          @keyframes spin { to { transform: rotate(360deg); } }
-        `}</style>
-        <div style={{ position: 'fixed', top: 20, right: 20 }}>
-          <ThemeToggle theme={theme} themeName={themeName} onToggle={onToggleTheme} />
-        </div>
-        <form onSubmit={e => { e.preventDefault(); if (resetPin.length === 4) verifyResetPin(resetPin); }} style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '40px 36px', maxWidth: 360, width: '100%', textAlign: 'center' }}>
-          <div style={{ fontSize: 11, letterSpacing: 4, color: theme.accent, marginBottom: 6, textTransform: 'uppercase' }}>Password Reset · Step 1 of 2</div>
-          <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 24, color: theme.text, fontWeight: 800, marginBottom: 10, letterSpacing: -0.5 }}>
-            Enter Telegram PIN
-          </h1>
-          <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.5, marginBottom: 20 }}>
-            A 4-digit reset PIN was sent to your Telegram. It expires in 5 minutes.
-          </p>
-          <input
-            type="text" inputMode="numeric" autoComplete="one-time-code" pattern="\d*" maxLength={4}
-            placeholder="0000" value={resetPin}
-            onChange={e => handleResetPinChange(e.target.value)}
-            autoFocus disabled={verifying}
-            style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 22, letterSpacing: 12, marginBottom: 14, display: 'block', fontWeight: 700, padding: '11px 0 11px 12px' })}
-          />
-          {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
-          <button type="submit" disabled={verifying || resetPin.length !== 4} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: (verifying || resetPin.length !== 4) ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
-            {verifying && <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />}
-            {verifying ? 'Verifying…' : 'Verify PIN'}
-          </button>
-          <button type="button" onClick={exitForgot} style={{ background: 'none', border: 'none', color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, cursor: 'pointer', letterSpacing: 1 }}>
-            ← Back to login
-          </button>
-        </form>
-      </div>
-    );
-  }
-
-  // ── Forgot password: step 3 (set new password — PIN already verified) ──
-  if (forgotMode === 'password') {
-    return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'JetBrains Mono', monospace", background: theme.bg, padding: 20, transition: 'background 0.2s ease' }}>
-        <style>{`
-          @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@600;700;800&display=swap');
-          @keyframes spin { to { transform: rotate(360deg); } }
-        `}</style>
-        <div style={{ position: 'fixed', top: 20, right: 20 }}>
-          <ThemeToggle theme={theme} themeName={themeName} onToggle={onToggleTheme} />
-        </div>
-        <form onSubmit={submitNewPassword} style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '40px 36px', maxWidth: 360, width: '100%', textAlign: 'center' }}>
-          <div style={{ fontSize: 11, letterSpacing: 4, color: theme.accent, marginBottom: 6, textTransform: 'uppercase' }}>Password Reset · Step 2 of 2</div>
-          <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 24, color: theme.text, fontWeight: 800, marginBottom: 10, letterSpacing: -0.5 }}>
-            PIN Verified ✓
-          </h1>
-          <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.5, marginBottom: 20 }}>
-            Now choose your new password.
-          </p>
-          <input type="password" placeholder="New password" value={newPw} onChange={e => setNewPw(e.target.value)} autoFocus
-            style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 15, marginBottom: 10 })} />
-          <input type="password" placeholder="Repeat new password" value={newPw2} onChange={e => setNewPw2(e.target.value)}
-            style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 15, marginBottom: 12 })} />
-          <div style={{ textAlign: 'left', marginBottom: 14 }}>
-            {pwChecks.map(c => (
-              <div key={c.label} style={{ fontSize: 12, lineHeight: 1.8, color: c.ok ? theme.accent : theme.textFaint }}>
-                {c.ok ? '✓' : '·'} {c.label}
-              </div>
-            ))}
-            <div style={{ fontSize: 12, lineHeight: 1.8, color: newPw2.length > 0 && newPw === newPw2 ? theme.accent : theme.textFaint }}>
-              {newPw2.length > 0 && newPw === newPw2 ? '✓' : '·'} Both passwords match
-            </div>
-          </div>
-          {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
-          <button type="submit" disabled={verifying || !pwOk || newPw !== newPw2} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: (verifying || !pwOk || newPw !== newPw2) ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
-            {verifying && <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />}
-            {verifying ? 'Changing…' : 'Change Password'}
-          </button>
-          <button type="button" onClick={exitForgot} style={{ background: 'none', border: 'none', color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, cursor: 'pointer', letterSpacing: 1 }}>
-            ← Cancel
-          </button>
-        </form>
-      </div>
-    );
-  }
-
-  // ── PIN step ──
-  if (challengeToken) {
-    return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'JetBrains Mono', monospace", background: theme.bg, padding: 20, transition: 'background 0.2s ease' }}>
-        <style>{`
-          @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@600;700;800&display=swap');
-          @keyframes spin { to { transform: rotate(360deg); } }
-        `}</style>
-        <div style={{ position: 'fixed', top: 20, right: 20 }}>
-          <ThemeToggle theme={theme} themeName={themeName} onToggle={onToggleTheme} />
-        </div>
-        <form onSubmit={e => { e.preventDefault(); if (pin.length === 4) verifyPin(pin); }} style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '40px 36px', maxWidth: 360, width: '100%', textAlign: 'center' }}>
-          <div style={{ fontSize: 11, letterSpacing: 4, color: theme.accent, marginBottom: 6, textTransform: 'uppercase' }}>Two-Factor Login</div>
-          <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 24, color: theme.text, fontWeight: 800, marginBottom: 10, letterSpacing: -0.5 }}>
-            Enter Telegram PIN
-          </h1>
-          <p style={{ color: theme.textDim, fontSize: 13, lineHeight: 1.5, marginBottom: 20 }}>
-            A 4-digit PIN was sent to your Telegram. It expires in 5 minutes.
-          </p>
-          <input
-            type="text"
-            inputMode="numeric"
-            autoComplete="one-time-code"
-            pattern="\d*"
-            maxLength={4}
-            placeholder="0000"
-            value={pin}
-            onChange={e => handlePinChange(e.target.value)}
-            autoFocus
-            disabled={verifying}
-            style={inputStyle(theme, {
-              width: '100%', textAlign: 'center', fontSize: 22, letterSpacing: 12,
-              marginBottom: 14, display: 'block', fontWeight: 700,
-              padding: '11px 0 11px 12px',
-            })}
-          />
-          {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
-          <button type="submit" disabled={verifying || pin.length !== 4} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: (verifying || pin.length !== 4) ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
-            {verifying && <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />}
-            {verifying ? 'Verifying…' : 'Verify PIN'}
-          </button>
-          <button type="button" onClick={backToLogin} style={{ background: 'none', border: 'none', color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, cursor: 'pointer', letterSpacing: 1 }}>
-            ← Back to login
-          </button>
-        </form>
-      </div>
-    );
-  }
+  useEffect(() => {
+    let cancelled = false;
+    loadGoogleIdentityServices()
+      .then((google) => {
+        if (cancelled) return;
+        google.accounts.id.initialize({
+          client_id: GOOGLE_CLIENT_ID,
+          callback: handleCredentialResponse,
+        });
+        if (buttonRef.current) {
+          google.accounts.id.renderButton(buttonRef.current, {
+            theme: themeName === 'light' ? 'outline' : 'filled_black',
+            size: 'large',
+            width: 280,
+            text: 'signin_with',
+          });
+        }
+        setGisReady(true);
+      })
+      .catch((err) => setError(err.message));
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [themeName, handleCredentialResponse]);
 
   return (
     <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: "'JetBrains Mono', monospace", background: theme.bg, padding: 20, transition: 'background 0.2s ease' }}>
@@ -1268,29 +905,27 @@ function LoginScreen({ onSuccess, theme, themeName, onToggleTheme }) {
       <div style={{ position: 'fixed', top: 20, right: 20 }}>
         <ThemeToggle theme={theme} themeName={themeName} onToggle={onToggleTheme} />
       </div>
-      <form onSubmit={handleSubmit} style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '40px 36px', maxWidth: 360, width: '100%', textAlign: 'center' }}>
+      <div style={{ background: theme.card, border: `1px solid ${theme.border}`, borderRadius: 14, padding: '40px 36px', maxWidth: 360, width: '100%', textAlign: 'center' }}>
         <div style={{ fontSize: 11, letterSpacing: 4, color: theme.accent, marginBottom: 6, textTransform: 'uppercase' }}>Membership System</div>
-        <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 28, color: theme.text, fontWeight: 800, marginBottom: 24, letterSpacing: -0.5 }}>
+        <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", fontSize: 28, color: theme.text, fontWeight: 800, marginBottom: 28, letterSpacing: -0.5 }}>
           Car Shop<br /><span style={{ color: theme.accent }}>Dashboard</span>
         </h1>
-        <input type="text" placeholder="Username" value={username} onChange={e => setUsername(e.target.value)} autoFocus autoCapitalize="none"
-          style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 16, marginBottom: 10 })} />
-        <input type="password" placeholder="Password" value={password} onChange={e => setPassword(e.target.value)}
-          style={inputStyle(theme, { width: '100%', textAlign: 'center', fontSize: 16, marginBottom: 14 })} />
-        {notice && <div style={{ color: theme.accent, fontSize: 13, marginBottom: 14, lineHeight: 1.5 }}>{notice}</div>}
-        {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 14 }}>{error}</div>}
-        <button type="submit" disabled={loading} style={{ ...btnStyle(theme.accent, theme.bg), width: '100%', opacity: loading ? 0.6 : 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
-          {loading && <span style={{ width: 14, height: 14, border: `2px solid ${theme.bg}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />}
-          {loading ? 'Checking…' : 'Login'}
-        </button>
-        <button type="button" onClick={startForgot} style={{ background: 'none', border: 'none', color: theme.textFaint, fontFamily: "'JetBrains Mono', monospace", fontSize: 12, cursor: 'pointer', letterSpacing: 1 }}>
-          Forgot password?
-        </button>
-      </form>
+        <div style={{ display: 'flex', justifyContent: 'center', minHeight: 44, alignItems: 'center', marginBottom: 14 }}>
+          {loading ? (
+            <span style={{ width: 20, height: 20, border: `2px solid ${theme.accent}`, borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />
+          ) : (
+            <div ref={buttonRef} />
+          )}
+          {!gisReady && !loading && <span style={{ color: theme.textFaint, fontSize: 12 }}>Loading Google Sign-In…</span>}
+        </div>
+        {error && <div style={{ color: '#ef4444', fontSize: 13, marginBottom: 6 }}>{error}</div>}
+        <p style={{ color: theme.textFaint, fontSize: 11, lineHeight: 1.6, marginTop: 14 }}>
+          Sign in with the Google account your Master or Admin registered for you. Not registered yet? Ask them to add your Google email in Staff settings.
+        </p>
+      </div>
     </div>
   );
 }
-
 // ════════════════════════════════════════════════
 // ── Staff Management panel (Admin only) ──
 const PERMISSION_LABELS = [
@@ -1312,7 +947,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
 
   // create form
   const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
+  const [googleEmail, setGoogleEmail] = useState('');
   const [role, setRole] = useState('Technician');
   const [perms, setPerms] = useState({ can_add_member: true, can_delete_member: false, can_add_points: true, can_deduct_points: true });
   const [creating, setCreating] = useState(false);
@@ -1336,10 +971,10 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
     try {
       await apiFetch('/api/staff', {
         method: 'POST',
-        body: JSON.stringify({ username: username.trim(), password, role, permissions: role === 'Admin' ? {} : perms }),
+        body: JSON.stringify({ username: username.trim(), googleEmail: googleEmail.trim(), role, permissions: role === 'Admin' ? {} : perms }),
       });
       toast(`${username.trim()} created!`);
-      setUsername(''); setPassword(''); setRole('Technician');
+      setUsername(''); setGoogleEmail(''); setRole('Technician');
       setPerms({ can_add_member: true, can_delete_member: false, can_add_points: true, can_deduct_points: true });
       setShowCreate(false);
       load();
@@ -1398,30 +1033,18 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
     }
   };
 
-  const resetPassword = async (member) => {
-    const np = window.prompt(`New password for ${member.username} (min 10 chars):`);
-    if (!np) return;
+  const editGoogleEmail = async (member) => {
+    const next = window.prompt(`Google email for ${member.username}:`, member.google_email || '');
+    if (next == null || !next.trim() || next.trim() === member.google_email) return;
     try {
-      await apiFetch(`/api/staff/${member.id}/reset-password`, {
-        method: 'POST', body: JSON.stringify({ newPassword: np }),
+      await apiFetch(`/api/staff/${member.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ googleEmail: next.trim() }),
       });
-      toast(`Password reset for ${member.username}. They'll need to log in again.`);
-    } catch (err) {
-      toast(`Reset failed: ${err.message}`, 'error');
-    }
-  };
-
-  const toggleRequire2fa = async (member) => {
-    const next = !member.require_2fa;
-    setStaff(prev => prev.map(s => s.id === member.id ? { ...s, require_2fa: next } : s)); // optimistic
-    try {
-      await apiFetch(`/api/staff/${member.id}/require-2fa`, {
-        method: 'POST', body: JSON.stringify({ required: next }),
-      });
-      toast(next ? `2FA now required for ${member.username}.` : `2FA requirement removed for ${member.username}.`, next ? 'success' : 'warn');
+      toast(`Google email updated for ${member.username}.`);
+      load();
     } catch (err) {
       toast(`Update failed: ${err.message}`, 'error');
-      load(); // revert
     }
   };
 
@@ -1436,7 +1059,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
   };
 
   const unlinkTelegram = async (member) => {
-    if (!window.confirm(`Remove ${member.username}'s Telegram link? They'll be logged out and can log in with password only (until they re-link).`)) return;
+    if (!window.confirm(`Remove ${member.username}'s Telegram link? They'll lose access to bot commands until they re-link. Login is unaffected.`)) return;
     try {
       await apiFetch(`/api/staff/${member.id}/unlink-telegram`, { method: 'POST' });
       toast(`${member.username}'s Telegram unlinked.`, 'warn');
@@ -1498,7 +1121,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
                       border: `1px solid ${member.telegram_linked ? '#10b98144' : theme.border}`,
                       padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700,
                     }}>
-                      {member.telegram_linked ? '2FA ON' : 'NO 2FA'}
+                      {member.telegram_linked ? 'BOT LINKED' : 'BOT NOT LINKED'}
                     </span>
                     {member.is_disabled && (
                       <span style={{ background: '#ef444422', color: '#ef4444', border: '1px solid #ef444466', padding: '2px 8px', borderRadius: 6, fontSize: 10, fontWeight: 700, letterSpacing: 1 }}>
@@ -1512,18 +1135,10 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
                     {isMaster && member.is_disabled && (
                       <button onClick={() => enableStaff(member)} style={{ background: '#10b98118', border: '1px solid #10b98155', color: '#10b981', borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>Re-enable</button>
                     )}
-                    <button onClick={() => toggleRequire2fa(member)} title="When required, this user is pushed to link Telegram at login and cannot unlink it themselves." style={{
-                      background: member.require_2fa ? '#f59e0b18' : 'none',
-                      border: `1px solid ${member.require_2fa ? '#f59e0b55' : theme.border}`,
-                      color: member.require_2fa ? '#f59e0b' : theme.textDim,
-                      borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
-                    }}>
-                      {member.require_2fa ? '2FA Required' : 'Require 2FA'}
-                    </button>
+                    <button onClick={() => editGoogleEmail(member)} title={member.google_email || 'No Google email set'} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textDim, borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>Edit Email</button>
                     {member.telegram_linked && (
                       <button onClick={() => unlinkTelegram(member)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textDim, borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>Unlink TG</button>
                     )}
-                    <button onClick={() => resetPassword(member)} style={{ background: 'none', border: `1px solid ${theme.border}`, color: theme.textDim, borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>Reset PW</button>
                     {member.id !== currentUserId && (
                       <button onClick={() => deleteStaff(member)} style={{ background: 'none', border: '1px solid #ef444455', color: '#ef4444', borderRadius: 6, padding: '4px 10px', cursor: 'pointer', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>Delete</button>
                     )}
@@ -1557,7 +1172,7 @@ function StaffPanel({ theme, currentUserId, currentUserRole, onClose }) {
             <div style={{ fontSize: 11, color: theme.accent, letterSpacing: 2, marginBottom: 12, textTransform: 'uppercase' }}>New Staff Account</div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
               <input type="text" placeholder="Username" value={username} onChange={e => setUsername(e.target.value)} required autoCapitalize="none" style={inputStyle(theme, { flex: '1 1 140px' })} />
-              <input type="text" placeholder="Password (min 10 chars)" value={password} onChange={e => setPassword(e.target.value)} required style={inputStyle(theme, { flex: '1 1 180px' })} />
+              <input type="email" placeholder="Google email (e.g. name@gmail.com)" value={googleEmail} onChange={e => setGoogleEmail(e.target.value)} required autoCapitalize="none" style={inputStyle(theme, { flex: '1 1 220px' })} />
               <select value={role} onChange={e => setRole(e.target.value)} style={inputStyle(theme, { flex: '0 0 auto', cursor: 'pointer' })}>
                 <option value="Technician">Technician</option>
                 {isMaster && <option value="Admin">Admin</option>}
@@ -1673,8 +1288,8 @@ function TrashPanel({ theme, onClose, onRestored }) {
   );
 }
 
-// ── Account dropdown menu (Change Password, Staff, Sign Out) ──
-function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTelegram, onLock }) {
+// ── Account dropdown menu (Staff, Telegram, Sign Out) ──
+function AccountMenu({ theme, isAdmin, onOpenStaff, onOpenTelegram, onLock }) {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
@@ -1720,8 +1335,7 @@ function AccountMenu({ theme, isAdmin, onChangePassword, onOpenStaff, onOpenTele
           boxShadow: '0 6px 24px rgba(0,0,0,0.3)',
           animation: 'fadeIn 0.12s ease both',
         }}>
-          {item('Change Password', onChangePassword)}
-          {item('Telegram 2FA', onOpenTelegram)}
+          {item('Telegram Bot', onOpenTelegram)}
           {isAdmin && item('Manage Staff', onOpenStaff)}
           <div style={{ height: 1, background: theme.border }} />
           {item('Sign Out', onLock, true)}
@@ -2005,7 +1619,6 @@ export default function App() {
   const [returningInfo, setReturningInfo] = useState(null); // returning-vehicle confirm gate
   const [connected, setConnected] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
-  const [showChangePassword, setShowChangePassword] = useState(false);
   const [showTelegram, setShowTelegram] = useState(false);
   const [showVehicleLookup, setShowVehicleLookup] = useState(false);
   const [serverWaking, setServerWaking] = useState(false);
@@ -2295,12 +1908,8 @@ export default function App() {
   if (!authed) {
     return (
       <LoginScreen
-        onSuccess={({ role, username, mustLink2fa }) => {
+        onSuccess={({ role, username }) => {
           setUserRole(role); setUserName(username); setAuthed(true);
-          if (mustLink2fa) {
-            setShowTelegram(true);
-            toast('An Admin requires Telegram 2FA on your account. Please link it now.', 'warn');
-          }
         }}
         theme={theme} themeName={themeName} onToggleTheme={toggleTheme}
       />
@@ -2330,7 +1939,6 @@ export default function App() {
           theme={theme} onConfirm={confirmDeleteMember} onCancel={() => setConfirmDelete(null)}
         />
       )}
-      {showChangePassword && <ChangePasswordModal onClose={() => setShowChangePassword(false)} theme={theme} />}
       {showTelegram && <TelegramModal onClose={() => setShowTelegram(false)} theme={theme} />}
       {showVehicleLookup && <VehicleLookupModal onClose={() => setShowVehicleLookup(false)} theme={theme} />}
       {showStaffPanel && isAdmin && <StaffPanel theme={theme} currentUserId={userId} currentUserRole={userRole} onClose={() => setShowStaffPanel(false)} />}
@@ -2361,7 +1969,6 @@ export default function App() {
               <AccountMenu
                 theme={theme}
                 isAdmin={isAdmin}
-                onChangePassword={() => setShowChangePassword(true)}
                 onOpenTelegram={() => setShowTelegram(true)}
                 onOpenStaff={() => setShowStaffPanel(true)}
                 onLock={() => { localStorage.removeItem('carshop_token'); localStorage.removeItem('carshop_role'); localStorage.removeItem('carshop_username'); setAuthed(false); }}

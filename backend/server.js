@@ -3,8 +3,8 @@ const http = require('http');
 const { Server } = require('socket.io');
 const { Pool } = require('pg');
 const cors = require('cors');
-const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
 const { z } = require('zod');
 // node-cron is optional: if it isn't installed we fall back to a setInterval
 // scheduler so the point-expiry job still runs. (Run: npm install node-cron)
@@ -44,17 +44,25 @@ const pool = new Pool(
 );
 
 // ── Staff accounts + session storage ──
-// Auth is per-staff-member: each user has a username, bcrypt password hash,
-// and a role ('Admin' or 'Technician'). Sessions live in the DB (survive
-// Render cold starts) and carry the staff id + role.
+// Auth is per-staff-member: each user has a username, a role, and (since the
+// Google-login migration) a google_email that must match the Google account
+// they sign in with. Sessions live in the DB (survive Render cold starts)
+// and carry the staff id + role.
 const SESSION_TTL_HOURS = 12;
+
+// ── Google Sign-In ──
+// GOOGLE_CLIENT_ID must be set on Render (same value the frontend uses).
+// The allowlist IS the staff_users.google_email column — only accounts an
+// Admin/Master has added, with a matching email, can ever get a session.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 async function ensureAuthTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS staff_users (
       id SERIAL PRIMARY KEY,
       username TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
+      google_email TEXT,
       role TEXT NOT NULL CHECK (role IN ('Master', 'Admin', 'Technician')),
       can_add_member BOOLEAN DEFAULT true,
       can_delete_member BOOLEAN DEFAULT false,
@@ -79,40 +87,39 @@ async function ensureAuthTables() {
   // Migration for existing installs (pre-existing rows get the deploy time,
   // which self-corrects as those 12-hour sessions expire).
   await pool.query(`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();`);
-  // Telegram 2FA: chat id per staff member + a pending link code.
+  // Telegram: chat id per staff member + a pending link code. This is now
+  // ONLY for using the staff bot commands (/customer, /leaderboard, etc.)
+  // and Master fraud alerts — it is no longer part of login.
   await pool.query(`
     ALTER TABLE staff_users
       ADD COLUMN IF NOT EXISTS telegram_chat_id BIGINT,
-      ADD COLUMN IF NOT EXISTS telegram_link_code TEXT,
-      ADD COLUMN IF NOT EXISTS require_2fa BOOLEAN DEFAULT false;
+      ADD COLUMN IF NOT EXISTS telegram_link_code TEXT;
   `);
-  // Pending logins waiting on a 4-digit PIN (short-lived).
+  // ── Google-login migration ──
+  // Login is now Google Sign-In only: a staff member's Google account email
+  // must exactly match staff_users.google_email (case-insensitive) for a
+  // session to be issued. This column IS the allowlist — only Admins/Masters
+  // adding a row here grants access, same as before with usernames.
+  await pool.query(`ALTER TABLE staff_users ADD COLUMN IF NOT EXISTS google_email TEXT;`);
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS login_challenges (
-      challenge_token TEXT PRIMARY KEY,
-      staff_id INT REFERENCES staff_users(id) ON DELETE CASCADE,
-      pin_hash TEXT NOT NULL,
-      attempts INT DEFAULT 0,
-      expires_at TIMESTAMP NOT NULL
-    );
+    CREATE UNIQUE INDEX IF NOT EXISTS staff_users_google_email_idx
+      ON staff_users (LOWER(google_email))
+      WHERE google_email IS NOT NULL;
   `);
-  // Challenges double as password-reset PINs; purpose keeps the two flows
-  // strictly separate (a reset PIN can't complete a login and vice versa).
-  // pin_verified marks a reset challenge whose PIN has been accepted, gating
-  // the set-new-password step.
-  await pool.query(`ALTER TABLE login_challenges ADD COLUMN IF NOT EXISTS purpose TEXT DEFAULT 'login';`);
-  await pool.query(`ALTER TABLE login_challenges ADD COLUMN IF NOT EXISTS pin_verified BOOLEAN DEFAULT false;`);
-  // Seed default owner accounts on first run (temp password from env or 'changeme-now').
+  // Drop the old password/PIN machinery — no longer used by any route.
+  await pool.query(`ALTER TABLE staff_users DROP COLUMN IF EXISTS password_hash;`);
+  await pool.query(`ALTER TABLE staff_users DROP COLUMN IF EXISTS require_2fa;`);
+  await pool.query(`DROP TABLE IF EXISTS login_challenges;`);
+  // Seed default owner accounts on first run — google_email starts NULL;
+  // set it manually in Neon once (see migration notes) before first login.
   const count = await pool.query('SELECT COUNT(*) FROM staff_users');
   if (parseInt(count.rows[0].count) === 0) {
-    const tempHash = await bcrypt.hash(process.env.ADMIN_PASSWORD || 'changeme-now', 12);
     await pool.query(
-      `INSERT INTO staff_users (username, password_hash, role) VALUES
-       ('aloysius', $1, 'Master'),
-       ('kishen', $1, 'Master')`,
-      [tempHash]
+      `INSERT INTO staff_users (username, role) VALUES
+       ('aloysius', 'Master'),
+       ('kishen', 'Master')`
     );
-    console.log('🔑 Seeded default Master accounts: aloysius, kishen (change passwords immediately).');
+    console.log('🔑 Seeded default Master accounts: aloysius, kishen. Set their google_email in Neon before logging in.');
   }
 }
 ensureAuthTables().catch(err => console.error('Auth tables setup failed:', err.message));
@@ -351,13 +358,10 @@ async function getSessionUser(token) {
   return result.rows[0] || null;
 }
 
-// ── Telegram 2FA helpers ──
-// Requires TELEGRAM_BOT_TOKEN env var (from @BotFather). If it's missing,
-// 2FA silently degrades: accounts without a linked chat log in as before,
-// and linking is disabled.
+// ── Telegram bot helpers ──
+// Requires TELEGRAM_BOT_TOKEN env var (from @BotFather). Used for staff bot
+// commands and Master fraud alerts — no longer part of login.
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const CHALLENGE_TTL_MINUTES = 5;
-const CHALLENGE_MAX_ATTEMPTS = 5;
 
 async function sendTelegram(chatId, text, replyMarkup = null) {
   const body = { chat_id: chatId, text };
@@ -1201,7 +1205,7 @@ async function processTelegramUpdate(update) {
   if (codeMatch.rows.length) {
     const staff = codeMatch.rows[0];
     await pool.query('UPDATE staff_users SET telegram_chat_id = $1, telegram_link_code = NULL WHERE id = $2', [chatId, staff.id]);
-    await sendTelegram(chatId, `Telegram linked to ${SHOP_NAME} staff account "${staff.username}". You'll now receive a 4-digit PIN on every login.`).catch(() => {});
+    await sendTelegram(chatId, `Telegram linked to ${SHOP_NAME} staff account "${staff.username}". You can now use bot commands like /help.`).catch(() => {});
     return;
   }
 
@@ -1590,9 +1594,13 @@ io.use(async (socket, next) => {
   }
 });
 
-// ── Rate limiter for /api/login ──
+// ── Google Sign-In login ──
+// Frontend sends the Google ID token credential from Google Identity
+// Services. We verify it against Google, then match the verified email
+// (case-insensitive) against staff_users.google_email — that column IS
+// the allowlist. No password, no PIN, nothing else to compromise.
 const loginAttempts = new Map();
-const LOGIN_LIMIT = 5;
+const LOGIN_LIMIT = 10;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 
 function loginRateLimiter(req, res, next) {
@@ -1611,284 +1619,52 @@ function loginRateLimiter(req, res, next) {
   next();
 }
 
-app.post('/api/login', loginRateLimiter, async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required.' });
+app.post('/api/login/google', loginRateLimiter, async (req, res) => {
+  const { credential } = req.body || {};
+  if (!credential) {
+    return res.status(400).json({ error: 'Missing Google credential.' });
+  }
+  if (!GOOGLE_CLIENT_ID) {
+    console.error('POST /api/login/google error: GOOGLE_CLIENT_ID is not set on the server.');
+    return res.status(500).json({ error: 'Google login is not configured on the server.' });
   }
   try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    if (!payload || !payload.email) {
+      return res.status(401).json({ error: 'Could not verify Google account.' });
+    }
+    // Google says this email isn't verified on their end — refuse it too.
+    if (payload.email_verified === false) {
+      return res.status(401).json({ error: 'Your Google email is not verified.' });
+    }
+    const email = String(payload.email).trim().toLowerCase();
+
     const result = await pool.query(
-      'SELECT id, username, password_hash, role, telegram_chat_id, require_2fa, is_disabled FROM staff_users WHERE LOWER(username) = LOWER($1)',
-      [username.trim()]
+      'SELECT id, username, role, is_disabled FROM staff_users WHERE LOWER(google_email) = $1',
+      [email]
     );
     const user = result.rows[0];
-    // Compare against a dummy hash when user not found so response timing
-    // doesn't reveal which usernames exist.
-    const hash = user?.password_hash || '$2a$12$invalidinvalidinvalidinvaliduuuuuuuuuuuuuuuuuuuuuuuuu';
-    const match = await bcrypt.compare(password, hash);
-    if (user && match) {
-      // Disabled by the fraud interceptor → refuse login until re-enabled.
-      if (user.is_disabled) {
-        return res.status(403).json({ error: 'This staff account has been disabled pending review. Contact a Master.' });
-      }
-      // ── Telegram 2FA branch ──
-      // If this staff member has linked Telegram (and the bot is configured),
-      // don't create a session yet: send a 4-digit PIN and return a short-lived
-      // challenge token. The session is created in /api/login/verify-2fa.
-      if (user.telegram_chat_id && TELEGRAM_BOT_TOKEN) {
-        const pin = String(Math.floor(1000 + Math.random() * 9000)); // 1000–9999
-        const pinHash = await bcrypt.hash(pin, 8);
-        const challengeToken = crypto.randomUUID() + crypto.randomUUID();
-
-        await pool.query(
-          `INSERT INTO login_challenges (challenge_token, staff_id, pin_hash, expires_at)
-           VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)`,
-          [challengeToken, user.id, pinHash, String(CHALLENGE_TTL_MINUTES)]
-        );
-
-        try {
-          await sendTelegram(
-            user.telegram_chat_id,
-            `🔐 Car Shop login PIN: ${pin}\n\nExpires in ${CHALLENGE_TTL_MINUTES} minutes. If this wasn't you, ignore this message and consider changing your password.`
-          );
-        } catch (tgErr) {
-          console.error('POST /api/login telegram error:', tgErr.message);
-          await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
-          return res.status(502).json({ error: 'Could not send the login PIN to Telegram. Please try again.' });
-        }
-
-        return res.json({ requires2fa: true, challengeToken, expiresInMinutes: CHALLENGE_TTL_MINUTES });
-      }
-
-      // No Telegram linked → normal single-factor login (unchanged behaviour).
-      // If an Admin has flagged this account as requiring 2FA, tell the
-      // frontend so it can push the user through linking right away.
-      const token = await createSession(user.id, user.role);
-      res.json({
-        success: true, token, role: user.role, username: user.username,
-        expiresInHours: SESSION_TTL_HOURS,
-        mustLink2fa: !!user.require_2fa && !!TELEGRAM_BOT_TOKEN,
-      });
-    } else {
-      res.status(401).json({ error: 'Incorrect username or password' });
+    if (!user) {
+      // Deliberately generic — don't reveal whether ANY account exists,
+      // just that this Google account isn't on the staff allowlist.
+      return res.status(401).json({ error: 'This Google account is not registered as staff. Ask a Master or Admin to add it in Staff settings.' });
     }
+    if (user.is_disabled) {
+      return res.status(403).json({ error: 'This staff account has been disabled pending review. Contact a Master.' });
+    }
+
+    const token = await createSession(user.id, user.role);
+    res.json({ success: true, token, role: user.role, username: user.username, expiresInHours: SESSION_TTL_HOURS });
   } catch (err) {
-    console.error('POST /api/login error:', err.message);
-    res.status(500).json({ error: 'Login failed. Try again.' });
+    console.error('POST /api/login/google error:', err.message);
+    res.status(401).json({ error: 'Could not verify Google sign-in. Please try again.' });
   }
 });
 
-// ── Verify the 4-digit PIN and complete login (public: user isn't logged in yet) ──
-app.post('/api/login/verify-2fa', loginRateLimiter, async (req, res) => {
-  const { challengeToken, pin } = req.body || {};
-  if (!challengeToken || !/^\d{4}$/.test(String(pin || ''))) {
-    return res.status(400).json({ error: 'Enter the 4-digit PIN.' });
-  }
-  try {
-    const result = await pool.query(
-      `SELECT c.challenge_token, c.staff_id, c.pin_hash, c.attempts, c.expires_at,
-              u.role, u.username
-         FROM login_challenges c
-         JOIN staff_users u ON u.id = c.staff_id
-        WHERE c.challenge_token = $1
-          AND COALESCE(c.purpose, 'login') = 'login'`,
-      [challengeToken]
-    );
-    const ch = result.rows[0];
-
-    if (!ch || new Date(ch.expires_at) <= new Date()) {
-      if (ch) await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
-      return res.status(401).json({ error: 'PIN expired. Please log in again.', restart: true });
-    }
-    if (ch.attempts >= CHALLENGE_MAX_ATTEMPTS) {
-      await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
-      return res.status(401).json({ error: 'Too many wrong PINs. Please log in again.', restart: true });
-    }
-
-    const match = await bcrypt.compare(String(pin), ch.pin_hash);
-    if (!match) {
-      await pool.query(
-        'UPDATE login_challenges SET attempts = attempts + 1 WHERE challenge_token = $1',
-        [challengeToken]
-      );
-      const left = CHALLENGE_MAX_ATTEMPTS - (ch.attempts + 1);
-      if (left <= 0) {
-        await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
-        return res.status(401).json({ error: 'Too many wrong PINs. Please log in again.', restart: true });
-      }
-      return res.status(401).json({ error: `Wrong PIN. ${left} attempt${left !== 1 ? 's' : ''} left.` });
-    }
-
-    // Success: burn the challenge, then create a normal session.
-    await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]);
-    const token = await createSession(ch.staff_id, ch.role);
-    res.json({ success: true, token, role: ch.role, username: ch.username, expiresInHours: SESSION_TTL_HOURS });
-  } catch (err) {
-    console.error('POST /api/login/verify-2fa error:', err.message);
-    res.status(500).json({ error: 'Could not verify PIN. Please try again.' });
-  }
-});
-
-// ── Forgot password, step 1: request a reset PIN via Telegram (public) ──
-// Only works for accounts with Telegram 2FA linked — that link IS the identity
-// proof. The response is the same whether or not the username exists, so the
-// login page can't be used to probe which staff accounts are real.
-app.post('/api/forgot-password', loginRateLimiter, async (req, res) => {
-  const { username } = req.body || {};
-  const generic = {
-    success: true,
-    message: 'If that account has Telegram linked, a 4-digit PIN has been sent to it.',
-  };
-  if (!username || !String(username).trim()) {
-    return res.status(400).json({ error: 'Enter your username.' });
-  }
-  try {
-    const result = await pool.query(
-      'SELECT id, username, telegram_chat_id, is_disabled FROM staff_users WHERE LOWER(username) = LOWER($1)',
-      [String(username).trim()]
-    );
-    const user = result.rows[0];
-    // No account, no Telegram link, disabled, or no bot configured → same
-    // generic answer, no PIN. (Disabled accounts must go through a Master.)
-    if (!user || !user.telegram_chat_id || user.is_disabled || !TELEGRAM_BOT_TOKEN) {
-      return res.json(generic);
-    }
-
-    // One live reset at a time per account.
-    await pool.query(
-      `DELETE FROM login_challenges WHERE staff_id = $1 AND COALESCE(purpose,'login') = 'reset'`,
-      [user.id]
-    );
-
-    const pin = String(Math.floor(1000 + Math.random() * 9000)); // 1000–9999
-    const pinHash = await bcrypt.hash(pin, 8);
-    const challengeToken = crypto.randomUUID() + crypto.randomUUID();
-    await pool.query(
-      `INSERT INTO login_challenges (challenge_token, staff_id, pin_hash, purpose, expires_at)
-       VALUES ($1, $2, $3, 'reset', NOW() + ($4 || ' minutes')::interval)`,
-      [challengeToken, user.id, pinHash, String(CHALLENGE_TTL_MINUTES)]
-    );
-
-    try {
-      await sendTelegram(
-        user.telegram_chat_id,
-        `🔑 Car Shop PASSWORD RESET PIN: ${pin}\n\nSomeone (hopefully you) asked to reset the password for "${user.username}". Expires in ${CHALLENGE_TTL_MINUTES} minutes.\n\nIf this wasn't you, ignore this message — your password is unchanged — and tell a Master.`
-      );
-    } catch (tgErr) {
-      console.error('POST /api/forgot-password telegram error:', tgErr.message);
-      await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
-      return res.status(502).json({ error: 'Could not send the PIN to Telegram. Please try again.' });
-    }
-
-    res.json({ ...generic, challengeToken, expiresInMinutes: CHALLENGE_TTL_MINUTES });
-  } catch (err) {
-    console.error('POST /api/forgot-password error:', err.message);
-    res.status(500).json({ error: 'Could not start the reset. Please try again.' });
-  }
-});
-
-// Password policy for resets: min 10 chars with at least one uppercase,
-// one lowercase, and one special character. Returns null if OK, else the
-// specific requirement that failed (so the user knows exactly what to fix).
-function passwordPolicyError(pw) {
-  const s = String(pw || '');
-  if (s.length < 10) return 'Password must be at least 10 characters.';
-  if (!/[A-Z]/.test(s)) return 'Password must include at least one uppercase letter.';
-  if (!/[a-z]/.test(s)) return 'Password must include at least one lowercase letter.';
-  if (!/[^A-Za-z0-9]/.test(s)) return 'Password must include at least one special character (e.g. ! @ # $ %).';
-  return null;
-}
-
-// ── Forgot password, step 2: verify the PIN only (public) ──
-// On success the challenge is marked pin_verified but NOT burned — the user
-// then sets the new password in step 3 against the same challenge token.
-app.post('/api/forgot-password/verify-pin', loginRateLimiter, async (req, res) => {
-  const { challengeToken, pin } = req.body || {};
-  if (!challengeToken || !/^\d{4}$/.test(String(pin || ''))) {
-    return res.status(400).json({ error: 'Enter the 4-digit PIN.' });
-  }
-  try {
-    const result = await pool.query(
-      `SELECT c.challenge_token, c.attempts, c.expires_at, c.pin_hash
-         FROM login_challenges c
-        WHERE c.challenge_token = $1
-          AND COALESCE(c.purpose, 'login') = 'reset'`,
-      [challengeToken]
-    );
-    const ch = result.rows[0];
-
-    if (!ch || new Date(ch.expires_at) <= new Date()) {
-      if (ch) await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
-      return res.status(401).json({ error: 'PIN expired. Please start the reset again.', restart: true });
-    }
-    if (ch.attempts >= CHALLENGE_MAX_ATTEMPTS) {
-      await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
-      return res.status(401).json({ error: 'Too many wrong PINs. Please start the reset again.', restart: true });
-    }
-
-    const match = await bcrypt.compare(String(pin), ch.pin_hash);
-    if (!match) {
-      await pool.query('UPDATE login_challenges SET attempts = attempts + 1 WHERE challenge_token = $1', [challengeToken]);
-      const left = CHALLENGE_MAX_ATTEMPTS - (ch.attempts + 1);
-      if (left <= 0) {
-        await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
-        return res.status(401).json({ error: 'Too many wrong PINs. Please start the reset again.', restart: true });
-      }
-      return res.status(401).json({ error: `Wrong PIN. ${left} attempt${left !== 1 ? 's' : ''} left.` });
-    }
-
-    // PIN accepted: unlock the set-password step for this challenge.
-    await pool.query('UPDATE login_challenges SET pin_verified = true WHERE challenge_token = $1', [challengeToken]);
-    res.json({ success: true, pinVerified: true });
-  } catch (err) {
-    console.error('POST /api/forgot-password/verify-pin error:', err.message);
-    res.status(500).json({ error: 'Could not verify PIN. Please try again.' });
-  }
-});
-
-// ── Forgot password, step 3: set the new password (public) ──
-// Only works on a challenge whose PIN was verified in step 2 and which hasn't
-// expired. Burns the challenge, updates the hash, kills all sessions.
-app.post('/api/forgot-password/complete', loginRateLimiter, async (req, res) => {
-  const { challengeToken, newPassword } = req.body || {};
-  if (!challengeToken) return res.status(400).json({ error: 'Missing reset session. Please start again.' });
-  const policyErr = passwordPolicyError(newPassword);
-  if (policyErr) return res.status(400).json({ error: policyErr });
-  try {
-    const result = await pool.query(
-      `SELECT c.challenge_token, c.staff_id, c.expires_at, c.pin_verified,
-              u.username, u.telegram_chat_id
-         FROM login_challenges c
-         JOIN staff_users u ON u.id = c.staff_id
-        WHERE c.challenge_token = $1
-          AND COALESCE(c.purpose, 'login') = 'reset'`,
-      [challengeToken]
-    );
-    const ch = result.rows[0];
-
-    if (!ch || new Date(ch.expires_at) <= new Date()) {
-      if (ch) await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]).catch(() => {});
-      return res.status(401).json({ error: 'Reset session expired. Please start again.', restart: true });
-    }
-    if (!ch.pin_verified) {
-      return res.status(401).json({ error: 'Verify the PIN first.', restart: true });
-    }
-
-    // Burn the challenge, set the new password, kill all existing sessions.
-    await pool.query('DELETE FROM login_challenges WHERE challenge_token = $1', [challengeToken]);
-    const hash = await bcrypt.hash(String(newPassword), 12);
-    await pool.query('UPDATE staff_users SET password_hash = $1 WHERE id = $2', [hash, ch.staff_id]);
-    await pool.query('DELETE FROM sessions WHERE staff_id = $1', [ch.staff_id]);
-
-    await auditSystem('PASSWORD_RESET_VIA_2FA', ch.staff_id, `"${ch.username}" reset their password via Telegram PIN`);
-    sendTelegram(ch.telegram_chat_id, `✅ Your Car Shop password for "${ch.username}" has been changed. If this wasn't you, tell a Master immediately.`).catch(() => {});
-
-    res.json({ success: true, message: 'Password changed. You can now log in with your new password.' });
-  } catch (err) {
-    console.error('POST /api/forgot-password/complete error:', err.message);
-    res.status(500).json({ error: 'Could not reset the password. Please try again.' });
-  }
-});
 
 // ── Telegram webhook (public: Telegram's servers call this) ──
 // Feeds the SAME router as the polling loop. NOT active unless you register
@@ -1909,9 +1685,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
 });
 
 app.use('/api', async (req, res, next) => {
-  if (req.path === '/login' || req.path === '/login/verify-2fa'
-      || req.path === '/forgot-password' || req.path === '/forgot-password/verify-pin'
-      || req.path === '/forgot-password/complete') return next();
+  if (req.path === '/login/google') return next();
   try {
     const user = await getSessionUser(req.headers['x-admin-token']);
     if (!user) {
@@ -1993,8 +1767,8 @@ const addCarSchema = z.object({
 const staffCreateSchema = z.object({
   username: z.preprocess(v => (v == null ? '' : String(v).trim()),
     z.string().min(1, 'Username is required.').max(50)),
-  password: z.string({ required_error: 'Password must be at least 10 characters.' })
-    .min(10, 'Password must be at least 10 characters.'),
+  googleEmail: z.preprocess(v => (v == null ? '' : String(v).trim().toLowerCase()),
+    z.string().email('Enter a valid Google email address.')),
   role: z.enum(['Master', 'Admin', 'Technician'], { errorMap: () => ({ message: 'Invalid role.' }) }),
   permissions: z.object({
     can_add_member: z.boolean().optional(),
@@ -2040,29 +1814,6 @@ app.get('/api/audit-logs', requireMaster, async (req, res) => {
   }
 });
 
-// ── Change password ──
-app.post('/api/change-password', async (req, res) => {
-  const { currentPassword, newPassword } = req.body;
-  if (!newPassword || newPassword.length < 10) {
-    return res.status(400).json({ error: 'New password must be at least 10 characters.' });
-  }
-  try {
-    const result = await pool.query('SELECT password_hash FROM staff_users WHERE id = $1', [req.user.id]);
-    const match = await bcrypt.compare(currentPassword || '', result.rows[0]?.password_hash || '');
-    if (!match) return res.status(401).json({ error: 'Current password is incorrect.' });
-
-    const newHash = await bcrypt.hash(newPassword, 12);
-    await pool.query('UPDATE staff_users SET password_hash = $1 WHERE id = $2', [newHash, req.user.id]);
-    // Invalidate this user's other sessions, keep them logged in with a fresh one.
-    await pool.query('DELETE FROM sessions WHERE staff_id = $1', [req.user.id]);
-    const token = await createSession(req.user.id, req.user.role);
-    res.json({ success: true, token });
-  } catch (err) {
-    console.error('POST /api/change-password error:', err.message);
-    res.status(500).json({ error: 'Could not change password.' });
-  }
-});
-
 // ── Who am I (returns my role + permissions so the UI can adapt) ──
 app.get('/api/me', (req, res) => {
   const u = req.user;
@@ -2083,7 +1834,7 @@ app.get('/api/me', (req, res) => {
 app.get('/api/telegram/status', async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT telegram_chat_id, telegram_link_code, require_2fa FROM staff_users WHERE id = $1',
+      'SELECT telegram_chat_id, telegram_link_code FROM staff_users WHERE id = $1',
       [req.user.id]
     );
     const row = result.rows[0] || {};
@@ -2091,7 +1842,6 @@ app.get('/api/telegram/status', async (req, res) => {
       botConfigured: !!TELEGRAM_BOT_TOKEN,
       linked: !!row.telegram_chat_id,
       pendingCode: row.telegram_link_code || null,
-      required: !!row.require_2fa,
     });
   } catch (err) {
     console.error('GET /api/telegram/status error:', err.message);
@@ -2139,19 +1889,14 @@ app.post('/api/telegram/confirm-link', async (req, res) => {
   }
 });
 
-// Unlink: turns 2FA off for this account (password required, so a stolen
-// session token alone can't silently remove 2FA).
+// Unlink: removes bot access for this account. Login itself is unaffected
+// since it no longer depends on Telegram at all — this only stops bot
+// commands (/customer, /leaderboard, etc.) from working for this account.
 app.post('/api/telegram/unlink', async (req, res) => {
-  const { password } = req.body || {};
   try {
-    const result = await pool.query('SELECT password_hash, telegram_chat_id, require_2fa FROM staff_users WHERE id = $1', [req.user.id]);
+    const result = await pool.query('SELECT telegram_chat_id FROM staff_users WHERE id = $1', [req.user.id]);
     const row = result.rows[0];
     if (!row?.telegram_chat_id) return res.status(400).json({ error: 'Telegram is not linked.' });
-    if (row.require_2fa && req.user.role !== 'Master') {
-      return res.status(403).json({ error: '2FA is required for your account and cannot be disabled. Ask a Master to remove it.' });
-    }
-    const match = await bcrypt.compare(password || '', row.password_hash || '');
-    if (!match) return res.status(401).json({ error: 'Password is incorrect.' });
 
     await pool.query(
       'UPDATE staff_users SET telegram_chat_id = NULL, telegram_link_code = NULL WHERE id = $1',
@@ -2171,9 +1916,9 @@ app.get('/api/staff', requireAdmin, async (req, res) => {
     // Technicians shouldn't even know owner accounts exist.
     const hideMasters = req.user.role !== 'Master' ? "WHERE role <> 'Master'" : '';
     const result = await pool.query(
-      `SELECT id, username, role, can_add_member, can_delete_member,
+      `SELECT id, username, google_email, role, can_add_member, can_delete_member,
               can_add_points, can_deduct_points, created_at,
-              require_2fa, is_disabled, (telegram_chat_id IS NOT NULL) AS telegram_linked
+              is_disabled, (telegram_chat_id IS NOT NULL) AS telegram_linked
          FROM staff_users ${hideMasters} ORDER BY created_at ASC`
     );
     res.json(result.rows);
@@ -2184,24 +1929,28 @@ app.get('/api/staff', requireAdmin, async (req, res) => {
 });
 
 app.post('/api/staff', requireAdmin, validateBody(staffCreateSchema), async (req, res) => {
-  const { username, password, role, permissions } = req.body; // validated + normalised
+  const { username, googleEmail, role, permissions } = req.body; // validated + normalised
   // Only a Master may create Admin or Master accounts. Admins create Technicians.
   if (role !== 'Technician' && req.user.role !== 'Master') {
     return res.status(403).json({ error: 'Only a Master can create Admin or Master accounts.' });
   }
   try {
-    const hash = await bcrypt.hash(password, 12);
     const p = permissions || {};
     const result = await pool.query(
-      `INSERT INTO staff_users (username, password_hash, role, can_add_member, can_delete_member, can_add_points, can_deduct_points)
+      `INSERT INTO staff_users (username, google_email, role, can_add_member, can_delete_member, can_add_points, can_deduct_points)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, username, role, can_add_member, can_delete_member, can_add_points, can_deduct_points, created_at`,
-      [username, hash, role, !!p.can_add_member, !!p.can_delete_member, !!p.can_add_points, !!p.can_deduct_points]
+       RETURNING id, username, google_email, role, can_add_member, can_delete_member, can_add_points, can_deduct_points, created_at`,
+      [username, googleEmail, role, !!p.can_add_member, !!p.can_delete_member, !!p.can_add_points, !!p.can_deduct_points]
     );
-    await auditLog(req, 'CREATE_STAFF', result.rows[0].id, `created ${role} "${username}"`);
+    await auditLog(req, 'CREATE_STAFF', result.rows[0].id, `created ${role} "${username}" (${googleEmail})`);
     res.json({ success: true, staff: result.rows[0] });
   } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'That username is already taken.' });
+    if (err.code === '23505' && err.constraint === 'staff_users_username_key') {
+      return res.status(409).json({ error: 'That username is already taken.' });
+    }
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'That Google email is already registered to another staff account.' });
+    }
     console.error('POST /api/staff error:', err.message);
     res.status(500).json({ error: 'Could not create staff account.' });
   }
@@ -2209,11 +1958,14 @@ app.post('/api/staff', requireAdmin, validateBody(staffCreateSchema), async (req
 
 app.put('/api/staff/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
-  const { role, permissions } = req.body;
+  const { role, permissions, googleEmail } = req.body;
   const p = permissions || {};
   try {
     if (role && !VALID_ROLES.includes(role)) {
       return res.status(400).json({ error: 'Invalid role.' });
+    }
+    if (googleEmail !== undefined && googleEmail !== null && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(googleEmail).trim())) {
+      return res.status(400).json({ error: 'Enter a valid Google email address.' });
     }
     const targetRes = await pool.query('SELECT role FROM staff_users WHERE id = $1', [id]);
     const targetRole = targetRes.rows[0]?.role;
@@ -2239,14 +1991,18 @@ app.put('/api/staff/:id', requireAdmin, async (req, res) => {
       `UPDATE staff_users
           SET role = COALESCE($2, role),
               can_add_member = $3, can_delete_member = $4,
-              can_add_points = $5, can_deduct_points = $6
+              can_add_points = $5, can_deduct_points = $6,
+              google_email = COALESCE($7, google_email)
         WHERE id = $1`,
-      [id, role || null, !!p.can_add_member, !!p.can_delete_member, !!p.can_add_points, !!p.can_deduct_points]
+      [id, role || null, !!p.can_add_member, !!p.can_delete_member, !!p.can_add_points, !!p.can_deduct_points,
+       googleEmail ? String(googleEmail).trim().toLowerCase() : null]
     );
-    // Changing permissions takes effect on their next request via getSessionUser.
-    await auditLog(req, 'UPDATE_STAFF', id, `role=${role || targetRole}, perms=${JSON.stringify(p)}`);
+    // Changing permissions/email takes effect on their next request via getSessionUser
+    // (or next login, for the email — sessions already open aren't affected).
+    await auditLog(req, 'UPDATE_STAFF', id, `role=${role || targetRole}, perms=${JSON.stringify(p)}${googleEmail ? `, google_email=${googleEmail}` : ''}`);
     res.json({ success: true });
   } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'That Google email is already registered to another staff account.' });
     console.error('PUT /api/staff error:', err.message);
     res.status(500).json({ error: 'Could not update staff account.' });
   }
@@ -2271,29 +2027,9 @@ async function requireManageTarget(req, res, next) {
   }
 }
 
-// ── Admin: require (or stop requiring) Telegram 2FA for a staff member ──
-// "Required" means: once linked they can't unlink themselves, and until
-// they link, the app pushes them through setup on every login.
-app.post('/api/staff/:id/require-2fa', requireAdmin, requireManageTarget, async (req, res) => {
-  const { id } = req.params;
-  const { required } = req.body || {};
-  try {
-    const result = await pool.query(
-      'UPDATE staff_users SET require_2fa = $2 WHERE id = $1 RETURNING id',
-      [id, !!required]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
-    await auditLog(req, 'SET_STAFF_2FA', id, `require_2fa=${!!required} for "${req.targetStaff.username}"`);
-    res.json({ success: true, required: !!required });
-  } catch (err) {
-    console.error('POST /api/staff require-2fa error:', err.message);
-    res.status(500).json({ error: 'Could not update 2FA requirement.' });
-  }
-});
-
 // ── Admin: forcibly remove a staff member's Telegram link ──
 // (e.g. they lost their phone / changed Telegram account). Their sessions
-// are wiped so the change takes effect immediately.
+// are NOT wiped — Telegram linking no longer affects login, only bot access.
 app.post('/api/staff/:id/unlink-telegram', requireAdmin, requireManageTarget, async (req, res) => {
   const { id } = req.params;
   try {
@@ -2302,30 +2038,11 @@ app.post('/api/staff/:id/unlink-telegram', requireAdmin, requireManageTarget, as
       [id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Staff member not found.' });
-    await pool.query('DELETE FROM sessions WHERE staff_id = $1', [id]); // force re-login
     await auditLog(req, 'UNLINK_STAFF_TELEGRAM', id, `unlinked Telegram for "${result.rows[0].username}"`);
     res.json({ success: true });
   } catch (err) {
     console.error('POST /api/staff unlink-telegram error:', err.message);
     res.status(500).json({ error: 'Could not unlink Telegram for that account.' });
-  }
-});
-
-app.post('/api/staff/:id/reset-password', requireAdmin, requireManageTarget, async (req, res) => {
-  const { id } = req.params;
-  const { newPassword } = req.body;
-  if (!newPassword || newPassword.length < 10) {
-    return res.status(400).json({ error: 'Password must be at least 10 characters.' });
-  }
-  try {
-    const hash = await bcrypt.hash(newPassword, 12);
-    await pool.query('UPDATE staff_users SET password_hash = $1 WHERE id = $2', [hash, id]);
-    await pool.query('DELETE FROM sessions WHERE staff_id = $1', [id]); // force re-login
-    await auditLog(req, 'RESET_STAFF_PASSWORD', id, `reset password for "${req.targetStaff.username}"`);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('POST /api/staff reset-password error:', err.message);
-    res.status(500).json({ error: 'Could not reset password.' });
   }
 });
 
